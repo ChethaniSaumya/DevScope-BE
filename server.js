@@ -7,6 +7,10 @@ const { Connection, PublicKey, Keypair } = require('@solana/web3.js');
 const bs58 = require('bs58');
 const dotenv = require('dotenv');
 const admin = require('firebase-admin');
+// Add these imports at the top with other requires
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs').promises;
 
 dotenv.config();
 
@@ -98,7 +102,7 @@ const DEMO_WALLETS = [
 async function saveAdminListToFirebase(listType, adminData) {
     try {
         console.log(`🔥 Saving ${listType} to Firebase:`, adminData);
-        
+
         const docRef = db.collection(listType).doc(adminData.id);
         await docRef.set({
             ...adminData,
@@ -117,10 +121,10 @@ async function saveAdminListToFirebase(listType, adminData) {
 async function loadAdminListFromFirebase(listType) {
     try {
         console.log(`📥 Loading ${listType} from Firebase`);
-        
+
         const snapshot = await db.collection(listType).orderBy('createdAt', 'desc').get();
         const adminList = [];
-        
+
         snapshot.forEach(doc => {
             adminList.push({
                 id: doc.id,
@@ -139,15 +143,72 @@ async function loadAdminListFromFirebase(listType) {
 async function deleteAdminFromFirebase(listType, adminId) {
     try {
         console.log(`🗑️ Deleting ${adminId} from Firebase ${listType}`);
-        
+
         await db.collection(listType).doc(adminId).delete();
-        
+
         console.log(`✅ SUCCESS: ${adminId} deleted from Firebase ${listType}`);
         return true;
     } catch (error) {
         console.error(`❌ ERROR deleting ${adminId} from Firebase ${listType}:`, error);
         return false;
     }
+}
+
+const SOUNDS_DIR = path.join(__dirname, 'uploads', 'sounds');
+
+// Ensure sounds directory exists
+async function ensureSoundsDir() {
+    try {
+        await fs.mkdir(SOUNDS_DIR, { recursive: true });
+        console.log('📁 Sounds directory created/verified');
+    } catch (error) {
+        console.error('Error creating sounds directory:', error);
+    }
+}
+
+// Configure multer for sound uploads
+const soundStorage = multer.diskStorage({
+    destination: async (req, file, cb) => {
+        await ensureSoundsDir();
+        cb(null, SOUNDS_DIR);
+    },
+    filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+        const ext = path.extname(file.originalname);
+        cb(null, `sound-${uniqueSuffix}${ext}`);
+    }
+});
+
+const uploadSound = multer({
+    storage: soundStorage,
+    limits: {
+        fileSize: 5 * 1024 * 1024 // 5MB limit
+    },
+    fileFilter: (req, file, cb) => {
+        const allowedMimes = [
+            'audio/wav', 'audio/wave', 'audio/x-wav',
+            'audio/mpeg', 'audio/mp3',
+            'audio/ogg', 'audio/vorbis',
+            'audio/mp4', 'audio/m4a', 'audio/x-m4a'
+        ];
+
+        if (allowedMimes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Invalid file type. Only audio files are allowed.'), false);
+        }
+    }
+});
+
+// Helper function to determine MIME type
+function getMimeType(ext) {
+    const mimeTypes = {
+        '.wav': 'audio/wav',
+        '.mp3': 'audio/mpeg',
+        '.ogg': 'audio/ogg',
+        '.m4a': 'audio/m4a'
+    };
+    return mimeTypes[ext.toLowerCase()] || 'audio/unknown';
 }
 
 // ========== ORIGINAL BOTSTATE CLASS ==========
@@ -276,7 +337,7 @@ class EnhancedBotState extends BotState {
     async loadAdminListsFromFirebase() {
         try {
             console.log('📥 Loading admin lists from Firebase...');
-            
+
             // Load primary admins
             const primaryAdmins = await loadAdminListFromFirebase('primary_admins');
             this.primaryAdminList.clear();
@@ -293,7 +354,7 @@ class EnhancedBotState extends BotState {
 
             this.isFirebaseLoaded = true;
             console.log(`✅ Firebase admin lists loaded: ${primaryAdmins.length} primary, ${secondaryAdmins.length} secondary`);
-            
+
             return true;
         } catch (error) {
             console.error('❌ Failed to load admin lists from Firebase:', error);
@@ -326,14 +387,14 @@ class EnhancedBotState extends BotState {
 
         // Save to Firebase
         await saveAdminListToFirebase(listType, config);
-        
+
         return config;
     }
 
     // Enhanced removeFromList with Firebase sync
     async removeFromList(listType, id) {
         let success = false;
-        
+
         // Remove from local state
         switch (listType) {
             case 'primary_admins':
@@ -348,7 +409,7 @@ class EnhancedBotState extends BotState {
         if (success) {
             await deleteAdminFromFirebase(listType, id);
         }
-        
+
         return success;
     }
 
@@ -457,6 +518,56 @@ async function isCommunityUsedInFirebase(communityId) {
         return false; // If error, don't block (safer approach)
     }
 }
+
+async function getPairAddressFromDexScreener(tokenAddress) {
+    try {
+        console.log(`🔍 Fetching pair address for token: ${tokenAddress}`);
+
+        // Use the actual token address, not hardcoded one
+        const url = `https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`;
+        
+        const response = await fetch(url, {
+            timeout: 10000, // 10 second timeout
+            headers: {
+                'User-Agent': 'DevScope-Bot/1.0'
+            }
+        });
+
+        if (!response.ok) {
+            console.log(`❌ DexScreener API error: ${response.status}`);
+            return null;
+        }
+
+        const data = await response.json();
+        console.log(`📊 DexScreener response:`, data);
+
+        if (data.pairs && data.pairs.length > 0) {
+            // Find Raydium pair first, or fallback to first available pair
+            let bestPair = data.pairs.find(pair =>
+                pair.dexId === 'raydium' ||
+                pair.dexId.toLowerCase().includes('raydium')
+            ) || data.pairs[0];
+
+            console.log(`✅ Found pair on ${bestPair.dexId}: ${bestPair.pairAddress}`);
+
+            return {
+                pairAddress: bestPair.pairAddress,
+                dexId: bestPair.dexId,
+                baseToken: bestPair.baseToken,
+                quoteToken: bestPair.quoteToken,
+                liquidity: bestPair.liquidity,
+                url: bestPair.url
+            };
+        }
+
+        console.log(`❌ No pairs found for token: ${tokenAddress}`);
+        return null;
+    } catch (error) {
+        console.error('❌ Error fetching pair data from DexScreener:', error);
+        return null;
+    }
+}
+
 
 async function markCommunityAsUsedInFirebase(communityId, tokenData) {
     try {
@@ -648,6 +759,49 @@ async function executeAPITrade(params) {
     }
 }
 
+app.get('/api/pair-address/:tokenAddress', async (req, res) => {
+    try {
+        const { tokenAddress } = req.params;
+
+        if (!tokenAddress) {
+            return res.status(400).json({ error: 'Token address is required' });
+        }
+
+        console.log(`🔍 Getting pair address for token: ${tokenAddress}`);
+        
+        const pairData = await getPairAddressFromDexScreener(tokenAddress);
+
+        if (pairData) {
+            console.log(`✅ Found pair data:`, pairData);
+            
+            res.json({
+                success: true,
+                tokenAddress,
+                pairData,
+                axiomUrl: `https://axiom.trade/meme/${pairData.pairAddress}`,
+                dexScreenerUrl: pairData.url
+            });
+        } else {
+            console.log(`❌ No pair found for token: ${tokenAddress}`);
+            
+            res.json({
+                success: false,
+                tokenAddress,
+                message: 'No pair found for this token',
+                fallbackAxiomUrl: `https://axiom.trade/meme/${tokenAddress}`
+            });
+        }
+    } catch (error) {
+        console.error('❌ Error in pair-address endpoint:', error);
+        res.status(500).json({ 
+            success: false,
+            error: error.message,
+            fallbackAxiomUrl: `https://axiom.trade/meme/${req.params.tokenAddress}`
+        });
+    }
+});
+
+
 async function snipeToken(tokenAddress, config) {
     console.log(`🎯 SNIPING: ${tokenAddress} with ${config.amount} SOL`);
 
@@ -663,8 +817,8 @@ async function snipeToken(tokenAddress, config) {
 
         const { signature } = await executeAPITrade(params);
 
-        // Generate token page URL based on settings
-        const tokenPageUrl = getTokenPageUrl(tokenAddress, botState.settings.tokenPageDestination);
+        // Generate token page URL with pair address lookup for Axiom
+        const tokenPageUrl = await getTokenPageUrl(tokenAddress, botState.settings.tokenPageDestination);
 
         broadcastToClients({
             type: 'snipe_success',
@@ -695,12 +849,30 @@ async function snipeToken(tokenAddress, config) {
     }
 }
 
-function getTokenPageUrl(tokenAddress, destination) {
+async function getTokenPageUrl(tokenAddress, destination, platform = null) {
+    console.log(`🌐 Generating token page URL for ${tokenAddress} on ${destination}`);
+
     switch (destination) {
         case 'neo_bullx':
             return `https://neo.bullx.io/terminal?chainId=1399811149&address=${tokenAddress}`;
+
         case 'axiom':
-            return `https://axiom.trade/token/${tokenAddress}`;
+            // Try to get pair address from DexScreener for Axiom
+            try {
+                const pairData = await getPairAddressFromDexScreener(tokenAddress);
+                
+                if (pairData && pairData.pairAddress) {
+                    console.log(`🎯 Using Axiom with pair address: ${pairData.pairAddress}`);
+                    return `https://axiom.trade/meme/${pairData.pairAddress}`;
+                } else {
+                    console.log(`⚠️ No pair found, using token address for Axiom: ${tokenAddress}`);
+                    return `https://axiom.trade/meme/${tokenAddress}`;
+                }
+            } catch (error) {
+                console.error('❌ Error getting pair address for Axiom:', error);
+                return `https://axiom.trade/meme/${tokenAddress}`;
+            }
+
         default:
             return `https://neo.bullx.io/terminal?chainId=1399811149&address=${tokenAddress}`;
     }
@@ -1125,6 +1297,160 @@ app.get('/api/firebase/used-communities', async (req, res) => {
     }
 });
 
+// Add these endpoints after the existing API routes
+
+// Get all uploaded sound files
+app.get('/api/sound-files', async (req, res) => {
+    try {
+        await ensureSoundsDir();
+
+        // ✅ LOAD METADATA FILE
+        const metadataPath = path.join(SOUNDS_DIR, 'metadata.json');
+        let metadata = {};
+
+        try {
+            const metadataContent = await fs.readFile(metadataPath, 'utf8');
+            metadata = JSON.parse(metadataContent);
+        } catch (error) {
+            console.log('No metadata file found, will use generated names');
+        }
+
+        const files = await fs.readdir(SOUNDS_DIR);
+        const soundFiles = [];
+
+        for (const filename of files) {
+            // Skip metadata file
+            if (filename === 'metadata.json') continue;
+
+            try {
+                const filePath = path.join(SOUNDS_DIR, filename);
+                const stats = await fs.stat(filePath);
+
+                soundFiles.push({
+                    filename,
+                    originalName: metadata[filename]?.originalName || filename, // ✅ USE STORED ORIGINAL NAME
+                    size: stats.size,
+                    uploadedAt: metadata[filename]?.uploadedAt || stats.birthtime,
+                    mimetype: metadata[filename]?.mimetype || getMimeType(path.extname(filename))
+                });
+            } catch (error) {
+                console.error(`Error getting stats for ${filename}:`, error);
+            }
+        }
+
+        res.json({
+            success: true,
+            files: soundFiles.sort((a, b) => new Date(b.uploadedAt) - new Date(a.uploadedAt))
+        });
+    } catch (error) {
+        console.error('Error fetching sound files:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Upload a new sound file
+app.post('/api/upload-sound', uploadSound.single('soundFile'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No sound file provided' });
+        }
+
+        const soundFile = {
+            filename: req.file.filename,
+            originalName: req.file.originalname, // ✅ This preserves the original name
+            size: req.file.size,
+            mimetype: req.file.mimetype,
+            uploadedAt: new Date(),
+            path: req.file.path
+        };
+
+        // ✅ SAVE ORIGINAL NAME TO A JSON FILE FOR RETRIEVAL
+        const metadataPath = path.join(SOUNDS_DIR, 'metadata.json');
+        let metadata = {};
+
+        try {
+            const existingData = await fs.readFile(metadataPath, 'utf8');
+            metadata = JSON.parse(existingData);
+        } catch (error) {
+            // File doesn't exist yet, start with empty object
+        }
+
+        metadata[req.file.filename] = {
+            originalName: req.file.originalname,
+            uploadedAt: new Date().toISOString(),
+            size: req.file.size,
+            mimetype: req.file.mimetype
+        };
+
+        await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+
+        console.log('🔊 Sound file uploaded:', soundFile);
+
+        res.json({
+            success: true,
+            message: 'Sound file uploaded successfully',
+            filename: soundFile.filename,
+            originalName: soundFile.originalName,
+            size: soundFile.size
+        });
+    } catch (error) {
+        console.error('Error uploading sound file:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Delete a sound file
+app.delete('/api/sound-files/:filename', async (req, res) => {
+    try {
+        const { filename } = req.params;
+        const filePath = path.join(SOUNDS_DIR, filename);
+
+        try {
+            await fs.access(filePath);
+            await fs.unlink(filePath);
+
+            // ✅ CLEAN UP METADATA
+            const metadataPath = path.join(SOUNDS_DIR, 'metadata.json');
+            try {
+                const metadataContent = await fs.readFile(metadataPath, 'utf8');
+                const metadata = JSON.parse(metadataContent);
+                delete metadata[filename];
+                await fs.writeFile(metadataPath, JSON.stringify(metadata, null, 2));
+            } catch (error) {
+                console.log('No metadata to clean up');
+            }
+
+            console.log('🗑️ Sound file deleted:', filename);
+
+            res.json({
+                success: true,
+                message: 'Sound file deleted successfully'
+            });
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                return res.status(404).json({ error: 'Sound file not found' });
+            }
+            throw error;
+        }
+    } catch (error) {
+        console.error('Error deleting sound file:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Serve uploaded sound files
+app.get('/api/sounds/:filename', (req, res) => {
+    const { filename } = req.params;
+    const filePath = path.join(SOUNDS_DIR, filename);
+
+    res.sendFile(filePath, (error) => {
+        if (error) {
+            console.error('Error serving sound file:', error);
+            res.status(404).json({ error: 'Sound file not found' });
+        }
+    });
+});
+
 app.delete('/api/firebase/used-communities/:communityId', async (req, res) => {
     try {
         const { communityId } = req.params;
@@ -1154,7 +1480,7 @@ app.get('/api/firebase/admin-lists', async (req, res) => {
     try {
         const primaryAdmins = await loadAdminListFromFirebase('primary_admins');
         const secondaryAdmins = await loadAdminListFromFirebase('secondary_admins');
-        
+
         res.json({
             success: true,
             data: {
@@ -1174,7 +1500,7 @@ app.get('/api/firebase/admin-lists', async (req, res) => {
 app.post('/api/firebase/sync-admin-lists', async (req, res) => {
     try {
         const success = await botState.loadAdminListsFromFirebase();
-        
+
         if (success) {
             // Broadcast sync update to all clients
             broadcastToClients({
@@ -1204,10 +1530,10 @@ app.post('/api/firebase/sync-admin-lists', async (req, res) => {
 app.delete('/api/firebase/admin-lists/:listType', async (req, res) => {
     try {
         const { listType } = req.params;
-        
+
         // Get all documents in the collection
         const snapshot = await db.collection(listType).get();
-        
+
         // Delete all documents
         const batch = db.batch();
         snapshot.docs.forEach(doc => {
@@ -1506,14 +1832,14 @@ app.post('/api/filter-settings', (req, res) => {
 app.get('/api/lists/:listType', async (req, res) => {
     try {
         const { listType } = req.params;
-        
+
         // Ensure Firebase data is loaded
         if (!botState.isFirebaseLoaded) {
             await botState.loadAdminListsFromFirebase();
         }
-        
+
         const list = botState.getList(listType);
-        res.json({ 
+        res.json({
             list,
             firebaseLoaded: botState.isFirebaseLoaded,
             count: list.length
@@ -1537,7 +1863,7 @@ app.post('/api/lists/:listType', async (req, res) => {
         }
 
         const config = await botState.addToList(listType, entry);
-        
+
         // Broadcast update to all connected clients
         broadcastToClients({
             type: 'admin_list_updated',
@@ -1550,8 +1876,8 @@ app.post('/api/lists/:listType', async (req, res) => {
             }
         });
 
-        res.json({ 
-            success: true, 
+        res.json({
+            success: true,
             config,
             message: `Entry added to ${listType} and saved to Firebase`,
             stats: botState.getStats()
@@ -1580,7 +1906,7 @@ app.delete('/api/lists/:listType/:id', async (req, res) => {
                 }
             });
 
-            res.json({ 
+            res.json({
                 success: true,
                 message: `Entry removed from ${listType} and Firebase`,
                 stats: botState.getStats()
@@ -1854,17 +2180,18 @@ wss.on('connection', (ws) => {
 
 async function initializeFirebaseData() {
     console.log('🔥 Initializing Firebase data...');
-    
+
     try {
         await testFirebase();
         await botState.loadAdminListsFromFirebase();
-        
+
         console.log('✅ Firebase initialization complete');
         console.log(`📊 Loaded admin lists:`, botState.getStats());
     } catch (error) {
         console.error('❌ Firebase initialization failed:', error);
     }
 }
+
 
 // ========== ERROR HANDLING ==========
 
@@ -1879,11 +2206,13 @@ server.listen(PORT, async () => {
     console.log(`🚀 DevScope backend running on port ${PORT}`);
     console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
     console.log(`HTTP API endpoint: http://localhost:${PORT}/api`);
-    
+
     // Initialize Firebase data
     await initializeFirebaseData();
-    
+    await ensureSoundsDir(); // ADD THIS LINE
+
     console.log('🔥 Enhanced Firebase Admin Lists Integration Loaded');
+    console.log('🔊 Sound upload system initialized');
     console.log('✅ Features:');
     console.log('  - Firebase storage for Primary/Secondary admin lists');
     console.log('  - Real-time sync between local state and Firebase');
@@ -1893,7 +2222,7 @@ server.listen(PORT, async () => {
     console.log('  - Twitter community detection and tracking');
     console.log('  - Enhanced token page opening on snipe');
     console.log('  - Improved speed optimizations');
-    
+
     console.log('🧪 Available Firebase endpoints:');
     console.log('  GET /api/firebase/admin-lists - Get all admin lists from Firebase');
     console.log('  POST /api/firebase/sync-admin-lists - Sync admin lists from Firebase');
@@ -1901,7 +2230,7 @@ server.listen(PORT, async () => {
     console.log('  GET /api/firebase/used-communities - Fetch used communities');
     console.log('  DELETE /api/firebase/used-communities - Clear all used communities');
     console.log('  GET /api/test-firebase - Test Firebase connection');
-    
+
     console.log('🎯 Demo data injection system loaded');
     console.log('Available demo endpoints:');
     console.log('  POST /api/demo/inject-token - Inject single demo token');
