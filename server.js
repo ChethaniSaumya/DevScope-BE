@@ -525,7 +525,7 @@ async function getPairAddressFromDexScreener(tokenAddress) {
 
         // Use the actual token address, not hardcoded one
         const url = `https://api.dexscreener.com/latest/dex/tokens/${tokenAddress}`;
-        
+
         const response = await fetch(url, {
             timeout: 10000, // 10 second timeout
             headers: {
@@ -768,12 +768,12 @@ app.get('/api/pair-address/:tokenAddress', async (req, res) => {
         }
 
         console.log(`🔍 Getting pair address for token: ${tokenAddress}`);
-        
+
         const pairData = await getPairAddressFromDexScreener(tokenAddress);
 
         if (pairData) {
             console.log(`✅ Found pair data:`, pairData);
-            
+
             res.json({
                 success: true,
                 tokenAddress,
@@ -783,7 +783,7 @@ app.get('/api/pair-address/:tokenAddress', async (req, res) => {
             });
         } else {
             console.log(`❌ No pair found for token: ${tokenAddress}`);
-            
+
             res.json({
                 success: false,
                 tokenAddress,
@@ -793,7 +793,7 @@ app.get('/api/pair-address/:tokenAddress', async (req, res) => {
         }
     } catch (error) {
         console.error('❌ Error in pair-address endpoint:', error);
-        res.status(500).json({ 
+        res.status(500).json({
             success: false,
             error: error.message,
             fallbackAxiomUrl: `https://axiom.trade/meme/${req.params.tokenAddress}`
@@ -860,7 +860,7 @@ async function getTokenPageUrl(tokenAddress, destination, platform = null) {
             // Try to get pair address from DexScreener for Axiom
             try {
                 const pairData = await getPairAddressFromDexScreener(tokenAddress);
-                
+
                 if (pairData && pairData.pairAddress) {
                     console.log(`🎯 Using Axiom with pair address: ${pairData.pairAddress}`);
                     return `https://axiom.trade/meme/${pairData.pairAddress}`;
@@ -895,6 +895,14 @@ async function fetchTokenMetadata(uri) {
 }
 
 // ========== TOKEN PROCESSING ==========
+// ========== REVERT TO YOUR ORIGINAL WORKING CODE ==========
+// Only fix the community detection logic, keep everything else EXACTLY the same
+
+// KEEP YOUR ORIGINAL connectToPumpPortal() - DON'T CHANGE IT
+// KEEP YOUR ORIGINAL connectToLetsBonk() - DON'T CHANGE IT  
+// KEEP YOUR ORIGINAL start/stop endpoints - DON'T CHANGE THEM
+
+// ONLY REPLACE processNewToken() function with this fixed version:
 
 async function processNewToken(tokenData, platform) {
     const tokenAddress = tokenData.mint;
@@ -966,6 +974,39 @@ async function processNewToken(tokenData, platform) {
         admin: twitterData.admin
     });
 
+    // ========== FIXED COMMUNITY REUSE CHECK ==========
+    if (twitterData.type === 'community' && twitterData.id && botState.settings.enableCommunityReuse) {
+        console.log(`🏘️ Checking if community ${twitterData.id} was used before...`);
+        const communityUsedInFirebase = await isCommunityUsedInFirebase(twitterData.id);
+        if (communityUsedInFirebase) {
+            console.log(`❌ COMMUNITY ALREADY USED: Community ${twitterData.id} skipped due to reuse prevention`);
+
+            // Add to detected tokens as blocked
+            const blockedTokenData = {
+                ...completeTokenData,
+                matchType: 'community_reused',
+                matchedEntity: `Community ${twitterData.id} (Already Used)`,
+                detectionReason: 'Community already used - blocked by reuse prevention',
+                blocked: true
+            };
+
+            botState.addDetectedToken(tokenAddress, blockedTokenData);
+
+            broadcastToClients({
+                type: 'token_detected',
+                data: {
+                    ...blockedTokenData,
+                    blocked: true,
+                    blockReason: 'Community already used'
+                }
+            });
+
+            return; // STOP PROCESSING - DON'T CONTINUE
+        } else {
+            console.log(`✅ Community ${twitterData.id} not used before, continuing processing...`);
+        }
+    }
+
     // Check if "snipe all tokens" mode is enabled
     if (botState.settings.snipeAllTokens) {
         console.log(`🎯 SNIPE ALL MODE: Token detected - ${tokenAddress}`);
@@ -978,6 +1019,11 @@ async function processNewToken(tokenData, platform) {
         };
 
         botState.addDetectedToken(tokenAddress, detectedTokenData);
+
+        // ✅ SAVE COMMUNITY TO FIREBASE WHEN DETECTED
+        if (twitterData.type === 'community' && twitterData.id) {
+            await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
+        }
 
         broadcastToClients({
             type: 'token_detected',
@@ -1001,17 +1047,6 @@ async function processNewToken(tokenData, platform) {
             if (twitterData.type === 'community') {
                 console.log(`🏘️ Found Twitter community: ${twitterData.id}`);
 
-                // Check for community reuse if enabled
-                if (botState.settings.enableCommunityReuse) {
-                    const communityUsedInFirebase = await isCommunityUsedInFirebase(twitterData.id);
-                    if (communityUsedInFirebase) {
-                        console.log(`❌ Community ${twitterData.id} already used (Firebase), skipping due to Prevent Community Reuse setting`);
-                        return;
-                    }
-                } else {
-                    console.log(`🔄 Community reuse allowed - Prevent Community Reuse is disabled`);
-                }
-
                 // Check if community ID is in primary admins list
                 const primaryAdminConfig = botState.checkAdminInPrimary(twitterData.id);
                 if (primaryAdminConfig) {
@@ -1026,7 +1061,9 @@ async function processNewToken(tokenData, platform) {
                     };
 
                     botState.addDetectedToken(tokenAddress, detectedTokenData);
-                    await markCommunityAsUsedInFirebase(twitterData.id, completeTokenData);
+
+                    // ✅ SAVE COMMUNITY TO FIREBASE ON PRIMARY MATCH
+                    await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
 
                     broadcastToClients({
                         type: 'token_detected',
@@ -1053,6 +1090,9 @@ async function processNewToken(tokenData, platform) {
                     };
 
                     botState.addDetectedToken(tokenAddress, detectedTokenData);
+
+                    // ✅ SAVE COMMUNITY TO FIREBASE ON SECONDARY MATCH
+                    await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
 
                     // Trigger popup for secondary matches
                     broadcastToClients({
@@ -1146,7 +1186,7 @@ async function processNewToken(tokenData, platform) {
             }
         }
 
-        // 2. CONSOLIDATED WALLET ADDRESS CHECKING (moved from wallet filtering to admin filtering)
+        // 2. CONSOLIDATED WALLET ADDRESS CHECKING
         if (creatorWallet) {
             console.log(`💰 Checking creator wallet: ${creatorWallet}`);
 
@@ -1228,6 +1268,11 @@ async function processNewToken(tokenData, platform) {
 
         botState.addDetectedToken(tokenAddress, detectedTokenData);
 
+        // ✅ SAVE COMMUNITY TO FIREBASE EVEN IF NO FILTERING
+        if (twitterData.type === 'community' && twitterData.id) {
+            await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
+        }
+
         broadcastToClients({
             type: 'token_detected',
             data: detectedTokenData
@@ -1236,17 +1281,6 @@ async function processNewToken(tokenData, platform) {
     }
 
     console.log(`❌ Token ${tokenAddress} doesn't match any criteria`);
-
-    // Log tokens that don't match for debugging
-    if (twitterData.type || creatorWallet) {
-        console.log(`📝 Token ${tokenAddress} has data but no matches:`, {
-            name: completeTokenData.name,
-            symbol: completeTokenData.symbol,
-            twitterType: twitterData.type,
-            twitterData: twitterData,
-            creatorWallet: creatorWallet
-        });
-    }
 }
 
 // ========== API ENDPOINTS ==========
@@ -2002,6 +2036,7 @@ function generateDemoTokenData(template, customWallet = null, customTwitter = nu
         };
     }
 }
+
 
 function generateRandomTokenAddress() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz123456789';
