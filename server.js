@@ -17,8 +17,8 @@ const UserAgent = require('user-agents');
 
 dotenv.config();
 
-// Initialize Firebase Admin SDK
-// Initialize Firebase Admin SDK from environment variables
+// Initialize Firebase Admin SDaK
+// Initialize Firebase Admin SDzK from environment variables
 const serviceAccount = {
     type: "service_account",
     project_id: process.env.FIREBASE_PROJECT_ID,
@@ -231,8 +231,6 @@ function getMimeType(ext) {
 // ========== ORIGINAL BOTSTATE CLASS ==========
 
 // ADD THIS TWITTER SCRAPER CLASS
-// ========== COMPLETE TwitterCommunityAdminScraper CLASS WITH AUTO-HEADLESS ==========
-
 class TwitterCommunityAdminScraper {
     constructor() {
         this.browser = null;
@@ -241,33 +239,20 @@ class TwitterCommunityAdminScraper {
         this.sessionActive = false;
         this.isInitialized = false;
         this.sessionPersistentDataDir = './session/twitter-session';
-        this.isHeadless = false; // Track current mode
-        this.loginDetectionInterval = null; // For checking login status
     }
 
     async init() {
         if (this.isInitialized) return true;
 
         try {
-            console.log('🤖 Initializing Twitter scraper...');
+            console.log('🤖 Initializing Twitter scraper with persistent session...');
 
             await this.ensureDirectories();
             const userAgent = new UserAgent({ deviceCategory: 'desktop' });
 
-            // Check if we already have a valid session
-            const hasValidSession = await this.checkExistingSession();
-
-            if (hasValidSession) {
-                console.log('✅ Valid session found - starting in HEADLESS mode');
-                this.isHeadless = true;
-            } else {
-                console.log('⚠️ No valid session - starting in VISIBLE mode for login');
-                this.isHeadless = false;
-            }
-
-            // Launch browser with appropriate mode
+            // Launch browser with persistent session
             this.browser = await chromium.launchPersistentContext(this.sessionPersistentDataDir, {
-                headless: this.isHeadless, // Dynamic headless mode
+                headless: false, // Keep visible so admin can login manually
                 userAgent: userAgent.toString(),
                 viewport: { width: 1366, height: 768 },
                 args: [
@@ -281,22 +266,13 @@ class TwitterCommunityAdminScraper {
                 ]
             });
 
+            // Get the default page (browser will open)
             const pages = this.browser.pages();
             this.page = pages[0] || await this.browser.newPage();
 
             this.isInitialized = true;
-
-            if (this.isHeadless) {
-                console.log('✅ Twitter scraper initialized in HEADLESS mode - ready to scrape');
-                this.sessionActive = true;
-            } else {
-                console.log('👁️ Twitter scraper initialized in VISIBLE mode - please login manually');
-                console.log('🔗 Opening Twitter login page...');
-                await this.page.goto('https://twitter.com/login');
-
-                // Start monitoring for successful login
-                this.startLoginDetection();
-            }
+            console.log('✅ Twitter scraper initialized with persistent session');
+            console.log('🔗 Browser opened - admin can now login to Twitter manually');
 
             return true;
         } catch (error) {
@@ -305,292 +281,17 @@ class TwitterCommunityAdminScraper {
         }
     }
 
-    // Check if we have existing valid session data
-    async checkExistingSession() {
+    async ensureDirectories() {
         try {
-            const fs = require('fs').promises;
-
-            // Check if session directory exists and has data
-            const sessionDir = this.sessionPersistentDataDir;
-
-            try {
-                const files = await fs.readdir(sessionDir);
-                const hasSessionFiles = files.some(file =>
-                    file.includes('cookies') ||
-                    file.includes('localStorage') ||
-                    file.includes('sessionStorage') ||
-                    file.includes('Local Storage')
-                );
-
-                if (hasSessionFiles) {
-                    console.log('🔍 Found existing session files');
-                    return true;
-                }
-            } catch (dirError) {
-                console.log('📁 No existing session directory found');
-            }
-
-            return false;
-        } catch (error) {
-            console.error('❌ Error checking existing session:', error);
-            return false;
-        }
-    }
-
-    async logout() {
-    if (!this.page) {
-        console.log('❌ Browser not initialized, cannot logout');
-        return false;
-    }
-
-    try {
-        console.log('🔓 Starting Twitter logout process...');
-
-        // Method 1: Try direct logout URL (most reliable)
-        try {
-            await this.page.goto('https://twitter.com/logout', { waitUntil: 'networkidle' });
-            await this.page.waitForTimeout(2000);
-
-            // Confirm logout if confirmation dialog appears
-            const confirmButton = await this.page.$('[data-testid="confirmationSheetConfirm"]');
-            if (confirmButton) {
-                await confirmButton.click();
-                console.log('✅ Confirmed logout');
-                await this.page.waitForTimeout(2000);
-            }
-        } catch (e) {
-            console.log('⚠️ Direct logout URL failed, trying alternative method...');
+            await fs.access('./session');
+        } catch {
+            await fs.mkdir('./session', { recursive: true });
         }
 
-        // Method 2: Try More menu logout (fallback)
         try {
-            // Navigate to home first
-            await this.page.goto('https://twitter.com/home');
-            await this.page.waitForTimeout(2000);
-
-            // Click on "More" menu
-            const moreButton = await this.page.waitForSelector('[data-testid="AppTabBar_More_Menu"]', { timeout: 5000 });
-            if (moreButton) {
-                await moreButton.click();
-                await this.page.waitForTimeout(1000);
-
-                // Look for logout option
-                const logoutOption = await this.page.waitForSelector('[data-testid="accountSwitcher"] >> text="Log out"', { timeout: 3000 });
-                if (logoutOption) {
-                    await logoutOption.click();
-                    console.log('✅ Clicked logout from More menu');
-                    await this.page.waitForTimeout(2000);
-                }
-            }
-        } catch (e) {
-            console.log('⚠️ More menu logout not found');
-        }
-
-        // Wait for logout to complete
-        await this.page.waitForTimeout(3000);
-
-        // Verify logout by checking current URL
-        const currentUrl = this.page.url();
-        console.log('🔍 Current URL after logout attempt:', currentUrl);
-
-        if (currentUrl.includes('login') || currentUrl.includes('logout') || 
-            currentUrl === 'https://twitter.com/' || currentUrl === 'https://x.com/') {
-            console.log('✅ Successfully logged out from Twitter');
-            this.sessionActive = false;
-            
-            // Broadcast logout success
-            broadcastToClients({
-                type: 'twitter_logout_success',
-                data: {
-                    success: true,
-                    message: 'Successfully logged out from Twitter',
-                    timestamp: new Date().toISOString()
-                }
-            });
-            
-            return true;
-        } else {
-            console.log('⚠️ Logout may not have completed, current URL:', currentUrl);
-            
-            // Still mark as logged out locally
-            this.sessionActive = false;
-            
-            broadcastToClients({
-                type: 'twitter_logout_partial',
-                data: {
-                    success: true,
-                    message: 'Logout attempted - session marked as inactive',
-                    timestamp: new Date().toISOString()
-                }
-            });
-            
-            return true; // Consider it successful since we tried
-        }
-
-    } catch (error) {
-        console.error('❌ Error during Twitter logout:', error);
-        
-        // Mark as logged out even if error occurred
-        this.sessionActive = false;
-        
-        broadcastToClients({
-            type: 'twitter_logout_error',
-            data: {
-                success: false,
-                error: error.message,
-                timestamp: new Date().toISOString()
-            }
-        });
-        
-        return false;
-    }
-}
-
-    // Start monitoring for successful login
-    startLoginDetection() {
-        console.log('👀 Starting login detection monitoring...');
-
-        this.loginDetectionInterval = setInterval(async () => {
-            try {
-                const isLoggedIn = await this.checkIfLoggedIn();
-
-                if (isLoggedIn) {
-                    console.log('🎉 LOGIN DETECTED! Switching to headless mode...');
-                    clearInterval(this.loginDetectionInterval);
-                    this.loginDetectionInterval = null;
-
-                    // Switch to headless mode
-                    await this.switchToHeadlessMode();
-                }
-            } catch (error) {
-                console.error('❌ Error during login detection:', error);
-            }
-        }, 3000); // Check every 3 seconds
-    }
-
-    // Check if user is logged in
-    async checkIfLoggedIn() {
-        try {
-            const currentUrl = this.page.url();
-            console.log(`🔍 Login check - Current URL: ${currentUrl}`);
-
-            // Check URL indicators
-            if (currentUrl.includes('home') ||
-                currentUrl.includes('timeline') ||
-                (currentUrl.includes('twitter.com') && !currentUrl.includes('login'))) {
-                console.log('✅ URL indicates login success');
-                return true;
-            }
-
-            // Check for logged-in elements
-            const loggedInSelectors = [
-                '[data-testid="SideNav_NewTweet_Button"]',
-                '[aria-label="Home timeline"]',
-                '[data-testid="AppTabBar_Home_Link"]',
-                '[data-testid="primaryColumn"]'
-            ];
-
-            for (const selector of loggedInSelectors) {
-                try {
-                    const element = await this.page.waitForSelector(selector, { timeout: 1000 });
-                    if (element) {
-                        console.log(`✅ Found logged-in element: ${selector}`);
-                        return true;
-                    }
-                } catch (e) {
-                    // Element not found, continue checking
-                }
-            }
-
-            return false;
-        } catch (error) {
-            console.error('❌ Error checking login status:', error);
-            return false;
-        }
-    }
-
-    // Switch from visible to headless mode
-    async switchToHeadlessMode() {
-        try {
-            console.log('🔄 SWITCHING TO HEADLESS MODE...');
-
-            // Close the visible browser
-            if (this.browser) {
-                console.log('🔒 Closing visible browser...');
-                await this.browser.close();
-            }
-
-            // Wait a moment for session to be saved
-            await new Promise(resolve => setTimeout(resolve, 2000));
-
-            // Launch new headless browser with same session
-            console.log('🤖 Launching headless browser...');
-            const userAgent = new UserAgent({ deviceCategory: 'desktop' });
-
-            this.browser = await chromium.launchPersistentContext(this.sessionPersistentDataDir, {
-                headless: true, // NOW HEADLESS
-                userAgent: userAgent.toString(),
-                viewport: { width: 1366, height: 768 },
-                args: [
-                    '--no-sandbox',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-web-security',
-                    '--disable-features=VizDisplayCompositor',
-                    '--disable-extensions',
-                    '--no-first-run',
-                    '--disable-default-apps'
-                ]
-            });
-
-            const pages = this.browser.pages();
-            this.page = pages[0] || await this.browser.newPage();
-
-            this.isHeadless = true;
-            this.sessionActive = true;
-
-            console.log('✅ SUCCESSFULLY SWITCHED TO HEADLESS MODE');
-            console.log('👻 Browser is now invisible and ready for scraping');
-
-            // Verify session works in headless mode
-            const sessionCheck = await this.checkSessionStatus();
-            if (sessionCheck.loggedIn) {
-                console.log('🎯 Headless session verified - ready to scrape communities!');
-
-                // Broadcast success to frontend
-                broadcastToClients({
-                    type: 'twitter_session_switched_headless',
-                    data: {
-                        success: true,
-                        message: 'Browser switched to headless mode - ready for invisible scraping',
-                        mode: 'headless',
-                        timestamp: new Date().toISOString()
-                    }
-                });
-
-            } else {
-                console.log('⚠️ Session verification failed in headless mode');
-
-                broadcastToClients({
-                    type: 'twitter_session_switch_failed',
-                    data: {
-                        success: false,
-                        message: 'Failed to verify session in headless mode',
-                        timestamp: new Date().toISOString()
-                    }
-                });
-            }
-
-        } catch (error) {
-            console.error('❌ Failed to switch to headless mode:', error);
-
-            broadcastToClients({
-                type: 'twitter_session_switch_error',
-                data: {
-                    success: false,
-                    error: error.message,
-                    timestamp: new Date().toISOString()
-                }
-            });
+            await fs.access(this.sessionPersistentDataDir);
+        } catch {
+            await fs.mkdir(this.sessionPersistentDataDir, { recursive: true });
         }
     }
 
@@ -601,107 +302,129 @@ class TwitterCommunityAdminScraper {
 
         try {
             const currentUrl = this.page.url();
-            console.log(`🔍 Session check - Current URL: ${currentUrl} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+            console.log(`🔍 Current page URL: ${currentUrl}`);
 
-            // Navigate to home to check session (works in both modes)
-            try {
-                await this.page.goto('https://twitter.com/home', { waitUntil: 'networkidle' });
-            } catch (navError) {
-                console.log('Navigation error, checking current page...');
+            // If we're on login page, definitely not logged in
+            if (currentUrl.includes('/login') || currentUrl.includes('/i/flow/login')) {
+                console.log('❌ On login page - not logged in');
+                this.sessionActive = false;
+                return { loggedIn: false, url: currentUrl };
             }
 
-            const newUrl = this.page.url();
+            // Check for logged-in indicators with multiple strategies
+            const loggedInCheck = await this.page.evaluate(() => {
+                // Strategy 1: Look for logout button (indicates logged in)
+                const logoutButton = document.querySelector('[data-testid="SideNav_LogoutButton_Button"]');
+                if (logoutButton) return { method: 'logout_button', loggedIn: true };
 
-            // Check for logged-in indicators
-            const loggedInIndicators = [
-                '[data-testid="SideNav_NewTweet_Button"]',
-                '[aria-label="Home timeline"]',
-                '[data-testid="AppTabBar_Home_Link"]',
-                '[data-testid="primaryColumn"]'
-            ];
+                // Strategy 2: Look for side navigation (indicates logged in)
+                const sideNav = document.querySelector('[data-testid="SideNav_NewTweet_Button"]');
+                if (sideNav) return { method: 'side_nav', loggedIn: true };
 
-            for (const indicator of loggedInIndicators) {
-                try {
-                    const element = await this.page.waitForSelector(indicator, { timeout: 2000 });
-                    if (element) {
-                        console.log(`✅ Session active (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}) - found: ${indicator}`);
-                        this.sessionActive = true;
-                        return { loggedIn: true, url: newUrl, mode: this.isHeadless ? 'headless' : 'visible' };
-                    }
-                } catch (e) {
-                    // Continue checking other indicators
-                }
-            }
+                // Strategy 3: Look for home timeline
+                const timeline = document.querySelector('[aria-label="Home timeline"]');
+                if (timeline) return { method: 'timeline', loggedIn: true };
 
-            // Check URL patterns
-            if (newUrl.includes('home') || newUrl.includes('timeline') ||
-                (newUrl.includes('twitter.com') && !newUrl.includes('login'))) {
-                console.log(`✅ Session appears active (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}) based on URL`);
-                this.sessionActive = true;
-                return { loggedIn: true, url: newUrl, mode: this.isHeadless ? 'headless' : 'visible' };
-            }
+                // Strategy 4: Look for user avatar/profile
+                const userAvatar = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
+                if (userAvatar) return { method: 'user_avatar', loggedIn: true };
 
-            console.log(`❌ Session not active (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
-            this.sessionActive = false;
-            return { loggedIn: false, url: newUrl, mode: this.isHeadless ? 'headless' : 'visible' };
+                // Strategy 5: Check for login-specific elements
+                const loginButton = document.querySelector('[data-testid="loginButton"]');
+                if (loginButton) return { method: 'login_button', loggedIn: false };
+
+                const signupButton = document.querySelector('[data-testid="signupButton"]');
+                if (signupButton) return { method: 'signup_button', loggedIn: false };
+
+                // If none found, default to logged out
+                return { method: 'default', loggedIn: false };
+            });
+
+            console.log(`🔍 Session check result:`, loggedInCheck);
+
+            this.sessionActive = loggedInCheck.loggedIn;
+            return {
+                loggedIn: loggedInCheck.loggedIn,
+                url: currentUrl,
+                method: loggedInCheck.method
+            };
 
         } catch (error) {
-            console.error(`❌ Error checking session status (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}):`, error);
-            return { loggedIn: false, error: error.message, mode: this.isHeadless ? 'headless' : 'visible' };
+            console.error('❌ Error checking session status:', error);
+            this.sessionActive = false;
+            return { loggedIn: false, error: error.message };
+        }
+    }
+
+    async openLoginPage() {
+        if (!this.page) {
+            throw new Error('Browser not initialized');
+        }
+
+        try {
+            console.log('🔗 Opening Twitter login page for manual login...');
+            await this.page.goto('https://twitter.com/login');
+            console.log('✅ Twitter login page opened - admin can now login manually');
+            return true;
+        } catch (error) {
+            console.error('❌ Failed to open login page:', error);
+            return false;
         }
     }
 
     async scrapeCommunityAdmins(communityId) {
-        console.log(`🎯 Scraping admins from community: ${communityId} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'} MODE)`);
+        console.log(`🎯 Scraping admins from community: ${communityId}`);
 
         // Check if session is active first
         const sessionStatus = await this.checkSessionStatus();
         if (!sessionStatus.loggedIn) {
-            console.log(`❌ Session not active in ${this.isHeadless ? 'headless' : 'visible'} mode. Login required.`);
-            throw new Error(`Twitter session not active. Please login ${this.isHeadless ? 'again' : 'manually'}.`);
+            console.log('❌ Twitter session not active. Admin needs to login manually.');
+            throw new Error('Twitter session not active. Please login manually first.');
         }
 
         const moderatorsUrl = `https://x.com/i/communities/${communityId}/moderators`;
 
         try {
-            console.log(`🌐 Navigating to: ${moderatorsUrl} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+            console.log(`🌐 Navigating to: ${moderatorsUrl}`);
             await this.page.goto(moderatorsUrl);
             await this.page.waitForTimeout(5000);
 
             // Check if we got redirected to login (session expired)
             const currentUrl = this.page.url();
             if (currentUrl.includes('login')) {
-                console.log(`❌ Redirected to login - session expired in ${this.isHeadless ? 'headless' : 'visible'} mode`);
-                throw new Error('Session expired. Please login again.');
+                console.log('❌ Redirected to login - session expired');
+                throw new Error('Session expired. Please login manually again.');
             }
 
             // PRIMARY METHOD: Screenshot + Text Analysis
-            console.log(`📸 Using screenshot method (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
+            console.log('📸 Using screenshot method (primary)...');
             const screenshotAdmins = await this.extractAdminsFromScreenshot(communityId);
 
             if (screenshotAdmins.length > 0) {
-                console.log(`✅ Screenshot method found ${screenshotAdmins.length} admin(s) (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+                console.log(`✅ Screenshot method found ${screenshotAdmins.length} admin(s)`);
                 return screenshotAdmins;
             }
 
             // BACKUP METHOD: DOM Scraping (only if screenshot fails)
-            console.log(`⚠️ Screenshot method failed, trying DOM scraping (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
+            console.log('⚠️ Screenshot method failed, trying DOM scraping...');
             const domAdmins = await this.extractAdminsFromDOM();
 
-            console.log(`✅ Found ${domAdmins.length} admin(s) using DOM method (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+            console.log(`✅ Found ${domAdmins.length} admin(s) using backup DOM method`);
             return domAdmins;
 
         } catch (error) {
-            console.error(`❌ Failed to scrape community ${communityId} in ${this.isHeadless ? 'headless' : 'visible'} mode:`, error);
+            console.error(`❌ Failed to scrape community ${communityId}:`, error);
             return [];
         }
     }
 
+    // Keep all your existing parsing methods unchanged
     parseAdminsFromText(pageText) {
+        // ... your existing code unchanged
         const lines = pageText.split('\n');
         const admins = [];
 
-        console.log(`🔍 Analyzing text for admin patterns (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
+        console.log('🔍 Analyzing text for admin patterns...');
 
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i].trim();
@@ -713,19 +436,19 @@ class TwitterCommunityAdminScraper {
                     admins.push({
                         username: prevLine,
                         badgeType: 'Admin',
-                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
+                        source: 'text_analysis',
                         pattern: 'username_before_admin'
                     });
-                    console.log(`👑 Found admin: @${prevLine} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+                    console.log(`👑 Found admin: @${prevLine} (pattern: username before Admin)`);
                 }
                 else if (nextLine && /^[a-zA-Z0-9_]{1,15}$/.test(nextLine)) {
                     admins.push({
                         username: nextLine,
                         badgeType: 'Admin',
-                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
+                        source: 'text_analysis',
                         pattern: 'username_after_admin'
                     });
-                    console.log(`👑 Found admin: @${nextLine} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+                    console.log(`👑 Found admin: @${nextLine} (pattern: username after Admin)`);
                 }
             }
             else if (line === 'Mod') {
@@ -733,19 +456,19 @@ class TwitterCommunityAdminScraper {
                     admins.push({
                         username: prevLine,
                         badgeType: 'Mod',
-                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
+                        source: 'text_analysis',
                         pattern: 'username_before_mod'
                     });
-                    console.log(`🛡️ Found mod: @${prevLine} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+                    console.log(`🛡️ Found mod: @${prevLine} (pattern: username before Mod)`);
                 }
                 else if (nextLine && /^[a-zA-Z0-9_]{1,15}$/.test(nextLine)) {
                     admins.push({
                         username: nextLine,
                         badgeType: 'Mod',
-                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
+                        source: 'text_analysis',
                         pattern: 'username_after_mod'
                     });
-                    console.log(`🛡️ Found mod: @${nextLine} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+                    console.log(`🛡️ Found mod: @${nextLine} (pattern: username after Mod)`);
                 }
             }
             else if (line.startsWith('@')) {
@@ -755,16 +478,16 @@ class TwitterCommunityAdminScraper {
 
                     if (prevLine === 'Admin' || nextLine === 'Admin') {
                         badgeType = 'Admin';
-                        console.log(`👑 Found admin: @${username} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+                        console.log(`👑 Found admin: @${username} (pattern: @username with Admin badge)`);
                     } else if (prevLine === 'Mod' || nextLine === 'Mod') {
                         badgeType = 'Mod';
-                        console.log(`🛡️ Found mod: @${username} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+                        console.log(`🛡️ Found mod: @${username} (pattern: @username with Mod badge)`);
                     }
 
                     admins.push({
                         username: username,
                         badgeType: badgeType,
-                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
+                        source: 'text_analysis',
                         pattern: '@username_format'
                     });
                 }
@@ -779,12 +502,12 @@ class TwitterCommunityAdminScraper {
                         if (nearbyLine === 'Admin') {
                             badgeType = 'Admin';
                             pattern = 'username_near_admin';
-                            console.log(`👑 Found admin: @${line} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+                            console.log(`👑 Found admin: @${line} (pattern: username near Admin)`);
                             break;
                         } else if (nearbyLine === 'Mod') {
                             badgeType = 'Mod';
                             pattern = 'username_near_mod';
-                            console.log(`🛡️ Found mod: @${line} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+                            console.log(`🛡️ Found mod: @${line} (pattern: username near Mod)`);
                             break;
                         }
                     }
@@ -794,7 +517,7 @@ class TwitterCommunityAdminScraper {
                     admins.push({
                         username: line,
                         badgeType: badgeType,
-                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
+                        source: 'text_analysis',
                         pattern: pattern
                     });
                 }
@@ -809,16 +532,17 @@ class TwitterCommunityAdminScraper {
             return 0;
         });
 
-        console.log(`🎯 Final unique admins found (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}): ${uniqueAdmins.length}`);
+        console.log(`🎯 Final unique admins found: ${uniqueAdmins.length}`);
         return uniqueAdmins;
     }
 
     async extractAdminsFromScreenshot(communityId) {
-        console.log(`📸 Taking screenshot and analyzing text (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
+        // ... your existing code unchanged
+        console.log('📸 Taking screenshot and analyzing text...');
 
         try {
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const screenshotFileName = `community_${communityId}_${this.isHeadless ? 'headless' : 'visible'}_${timestamp}.png`;
+            const screenshotFileName = `community_${communityId}_${timestamp}.png`;
             const screenshotPath = `./output/${screenshotFileName}`;
 
             await this.ensureOutputDirectory();
@@ -829,30 +553,31 @@ class TwitterCommunityAdminScraper {
                 type: 'png'
             });
 
-            console.log(`📸 Screenshot saved (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}): ${screenshotPath}`);
+            console.log(`📸 Screenshot saved: ${screenshotPath}`);
 
             const pageText = await this.page.evaluate(() => {
                 return document.body.innerText;
             });
 
-            const textFileName = `community_${communityId}_${this.isHeadless ? 'headless' : 'visible'}_text_${timestamp}.txt`;
+            const textFileName = `community_${communityId}_text_${timestamp}.txt`;
             const textPath = `./output/${textFileName}`;
             await this.saveTextFile(textPath, pageText);
 
             const admins = this.parseAdminsFromText(pageText);
 
-            console.log(`🔍 Text analysis found ${admins.length} admin(s) (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
+            console.log(`📝 Text analysis found ${admins.length} admin(s)`);
 
             return admins;
 
         } catch (error) {
-            console.error(`❌ Screenshot method failed (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}):`, error);
+            console.error('❌ Screenshot method failed:', error);
             return [];
         }
     }
 
     async extractAdminsFromDOM() {
-        console.log(`🔧 Using DOM scraping (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
+        // ... your existing code unchanged
+        console.log('🔧 Using DOM scraping (backup method)...');
 
         return await this.page.evaluate(() => {
             const userCells = document.querySelectorAll('div[data-testid="UserCell"]');
@@ -893,39 +618,13 @@ class TwitterCommunityAdminScraper {
     }
 
     async close() {
-        // Clear login detection interval
-        if (this.loginDetectionInterval) {
-            clearInterval(this.loginDetectionInterval);
-            this.loginDetectionInterval = null;
-            console.log('🔄 Login detection monitoring stopped');
-        }
-
         if (this.browser) {
             await this.browser.close();
             this.isInitialized = false;
-            console.log(`✅ Browser closed (was in ${this.isHeadless ? 'HEADLESS' : 'VISIBLE'} mode)`);
-        }
-    }
-
-    async ensureDirectories() {
-        const fs = require('fs').promises;
-
-        try {
-            await fs.access('./session');
-        } catch {
-            await fs.mkdir('./session', { recursive: true });
-        }
-
-        try {
-            await fs.access(this.sessionPersistentDataDir);
-        } catch {
-            await fs.mkdir(this.sessionPersistentDataDir, { recursive: true });
         }
     }
 
     async ensureOutputDirectory() {
-        const fs = require('fs').promises;
-
         try {
             await fs.access('./output');
         } catch {
@@ -935,11 +634,9 @@ class TwitterCommunityAdminScraper {
     }
 
     async saveTextFile(filePath, content) {
-        const fs = require('fs').promises;
-
         try {
             await fs.writeFile(filePath, content, 'utf8');
-            console.log(`📁 Text saved: ${filePath}`);
+            console.log(`📝 Text saved: ${filePath}`);
         } catch (error) {
             console.error('❌ Failed to save text file:', error);
         }
@@ -1358,8 +1055,13 @@ async function getTwitterDataFromToken(tokenData) {
                 });
 
                 if (response.ok) {
-                    metadata = await response.json();
-                    console.log('📄 Metadata fetched:', metadata);
+                    try {
+                        metadata = await response.json();
+                        console.log('📄 Metadata fetched:', metadata);
+                    } catch (jsonError) {
+                        console.log(`⚠️ Metadata not JSON (probably HTML error page): ${tokenData.uri}`);
+                        metadata = {};
+                    }
                 } else {
                     console.log(`❌ Failed to fetch metadata: ${response.status}`);
                 }
@@ -1549,7 +1251,6 @@ app.get('/api/pair-address/:tokenAddress', async (req, res) => {
     }
 });
 
-
 async function snipeToken(tokenAddress, config) {
     console.log(`🎯 SNIPING: ${tokenAddress} with ${config.amount} SOL`);
 
@@ -1565,7 +1266,7 @@ async function snipeToken(tokenAddress, config) {
 
         const { signature } = await executeAPITrade(params);
 
-        // Generate token page URL with pair address lookup for Axiom
+        // 🔥 GENERATE TOKEN PAGE URL BEFORE BROADCASTING
         const tokenPageUrl = await getTokenPageUrl(tokenAddress, botState.settings.tokenPageDestination);
 
         broadcastToClients({
@@ -1576,7 +1277,8 @@ async function snipeToken(tokenAddress, config) {
                 amount: config.amount,
                 tokenPageUrl,
                 timestamp: new Date().toISOString(),
-                openTokenPage: true // Signal to open token page
+                openTokenPage: true,
+                destination: botState.settings.tokenPageDestination // ADD THIS LINE
             }
         });
 
@@ -1605,8 +1307,9 @@ async function getTokenPageUrl(tokenAddress, destination, platform = null) {
             return `https://neo.bullx.io/terminal?chainId=1399811149&address=${tokenAddress}`;
 
         case 'axiom':
-            // Try to get pair address from DexScreener for Axiom
+            // Always try to get pair address from DexScreener for Axiom
             try {
+                console.log(`🔍 Fetching pair address for Axiom...`);
                 const pairData = await getPairAddressFromDexScreener(tokenAddress);
 
                 if (pairData && pairData.pairAddress) {
@@ -1653,8 +1356,7 @@ async function fetchTokenMetadata(uri) {
 // ONLY REPLACE processNewToken() function with this fixed version:
 
 // ADD THIS COMMUNITY MATCHING FUNCTION
-// ADD THIS COMMUNITY MATCHING FUNCTION
-async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
+ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
     try {
         console.log(`🔍 Scraping community ${communityId} for admin matching...`);
 
@@ -1778,14 +1480,14 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
         const communityAdmins = await twitterScraper.scrapeCommunityAdmins(communityId);
 
         if (communityAdmins.length === 0) {
-            console.log(`⚠️ No admins found in community ${communityId}`);
+            console.log(`⚠️ Community ${communityId} has no visible admins (private or empty community)`);
 
             // Broadcast no admins found
             broadcastToClients({
-                type: 'community_scraping_failed',
+                type: 'community_scraping_info',
                 data: {
                     communityId: communityId,
-                    reason: 'No admins found in community',
+                    reason: 'Community has no visible admins (private/empty)',
                     step: 'scraping',
                     fallbackUsed: true,
                     communityIdInPrimary: botState.checkAdminInPrimary(communityIdStr) ? true : false,
@@ -1981,7 +1683,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
     }
 }
 
-// ========== COMPLETE ENHANCED processNewToken FUNCTION ==========
+// ========== COMPLETE ENHANCED processNewToken FUNCTION WITH GLOBAL SETTINGS ==========
 async function processNewToken(tokenData, platform) {
     const tokenAddress = tokenData.mint;
     const creatorWallet = tokenData.creator || tokenData.traderPublicKey;
@@ -2052,99 +1754,20 @@ async function processNewToken(tokenData, platform) {
         admin: twitterData.admin
     });
 
-    // ========== FIXED COMMUNITY REUSE CHECK ==========
-    if (twitterData.type === 'community' && twitterData.id && botState.settings.enableCommunityReuse) {
-        console.log(`🏘️ Checking if community ${twitterData.id} was used before...`);
-        const communityUsedInFirebase = await isCommunityUsedInFirebase(twitterData.id);
-        if (communityUsedInFirebase) {
-            console.log(`❌ COMMUNITY ALREADY USED: Community ${twitterData.id} skipped due to reuse prevention`);
-
-            // Add to detected tokens as blocked
-            const blockedTokenData = {
-                ...completeTokenData,
-                matchType: 'community_reused',
-                matchedEntity: `Community ${twitterData.id} (Already Used)`,
-                detectionReason: 'Community already used - blocked by reuse prevention',
-                blocked: true
-            };
-
-            botState.addDetectedToken(tokenAddress, blockedTokenData);
-
-            broadcastToClients({
-                type: 'token_detected',
-                data: {
-                    ...blockedTokenData,
-                    blocked: true,
-                    blockReason: 'Community already used'
-                }
-            });
-
-            return; // STOP PROCESSING - DON'T CONTINUE
-        } else {
-            console.log(`✅ Community ${twitterData.id} not used before, continuing processing...`);
-        }
-    }
-
-    // ========== NEW: COMMUNITY ADMIN SCRAPING AND MATCHING ==========
+    // ========== SIMPLIFIED COMMUNITY REUSE CHECK ==========
     if (botState.settings.enableAdminFilter && twitterData.type === 'community' && twitterData.id) {
-        console.log(`🏘️ Found Twitter community: ${twitterData.id} - scraping admins for matching...`);
+        console.log(`🏘️ Found Twitter community: ${twitterData.id} - checking if community was used before...`);
 
-        // Scrape community admins and match with our lists
-        const communityMatchResult = await scrapeCommunityAndMatchAdmins(twitterData.id, completeTokenData);
+        // ✅ SIMPLIFIED: Just check if community was used before
+        const communityUsed = await isCommunityUsedInFirebase(twitterData.id);
 
-        if (communityMatchResult && communityMatchResult.matchType !== 'no_match') {
-            console.log(`🎯 Community admin match found: ${communityMatchResult.matchType}`);
-
-            const detectedTokenData = {
-                ...completeTokenData,
-                matchType: communityMatchResult.matchType,
-                matchedEntity: communityMatchResult.matchedEntity,
-                detectionReason: communityMatchResult.detectionReason,
-                config: communityMatchResult.config,
-                communityAdmins: communityMatchResult.communityAdmins,
-                matchedAdmin: communityMatchResult.matchedAdmin
-            };
-
-            botState.addDetectedToken(tokenAddress, detectedTokenData);
-
-            // Save community to Firebase on match
-            await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
-
-            if (communityMatchResult.matchType === 'primary_admin') {
-                broadcastToClients({
-                    type: 'token_detected',
-                    data: detectedTokenData
-                });
-
-                if (!botState.settings.detectionOnlyMode) {
-                    await snipeToken(tokenAddress, communityMatchResult.config);
-                }
-            } else if (communityMatchResult.matchType === 'secondary_admin') {
-                // Trigger popup for secondary matches
-                broadcastToClients({
-                    type: 'secondary_popup_trigger',
-                    data: {
-                        tokenData: detectedTokenData,
-                        globalSnipeSettings: botState.settings.globalSnipeSettings,
-                        timestamp: new Date().toISOString()
-                    }
-                });
-
-                // Play sound notification
-                broadcastToClients({
-                    type: 'secondary_notification',
-                    data: {
-                        tokenAddress,
-                        soundNotification: communityMatchResult.config.soundNotification,
-                        timestamp: new Date().toISOString()
-                    }
-                });
-            }
-            return;
-        } else {
-            console.log(`❌ No community admins from ${twitterData.id} found in admin lists`);
-            // Continue with regular processing if no admin match found
+        if (communityUsed) {
+            console.log(`❌ Community ${twitterData.id} was already used before - skipping token`);
+            return; // Skip this token
         }
+
+        console.log(`✅ Community ${twitterData.id} is new - continuing with detection...`);
+        // Continue with normal wallet/admin detection below
     }
 
     // Check if "snipe all tokens" mode is enabled
@@ -2171,8 +1794,22 @@ async function processNewToken(tokenData, platform) {
         });
 
         if (!botState.settings.detectionOnlyMode) {
-            const defaultConfig = botState.settings.globalSnipeSettings;
-            await snipeToken(tokenAddress, defaultConfig);
+            // ✅ USE GLOBAL SETTINGS FOR SPEED
+            const snipeResult = await snipeToken(tokenAddress, botState.settings.globalSnipeSettings);
+
+            // 🔥 AUTO-OPEN TOKEN PAGE AFTER SUCCESSFUL SNIPE ALL
+            if (snipeResult.success && snipeResult.tokenPageUrl) {
+                console.log('🌐 Auto-opening token page after snipe all...');
+                broadcastToClients({
+                    type: 'auto_open_token_page',
+                    data: {
+                        tokenAddress,
+                        tokenPageUrl: snipeResult.tokenPageUrl,
+                        destination: botState.settings.tokenPageDestination,
+                        reason: 'snipe_all_success'
+                    }
+                });
+            }
         }
         return;
     }
@@ -2206,7 +1843,23 @@ async function processNewToken(tokenData, platform) {
                 });
 
                 if (!botState.settings.detectionOnlyMode) {
-                    await snipeToken(tokenAddress, primaryAdminConfig);
+                    // ✅ USE GLOBAL SETTINGS FOR SPEED
+                    const snipeResult = await snipeToken(tokenAddress, botState.settings.globalSnipeSettings);
+
+                    // 🔥 AUTO-OPEN TOKEN PAGE AFTER SUCCESSFUL TWITTER ADMIN SNIPE
+                    if (snipeResult.success && snipeResult.tokenPageUrl) {
+                        console.log('🌐 Auto-opening token page after primary Twitter admin snipe...');
+                        broadcastToClients({
+                            type: 'auto_open_token_page',
+                            data: {
+                                tokenAddress,
+                                tokenPageUrl: snipeResult.tokenPageUrl,
+                                destination: botState.settings.tokenPageDestination,
+                                reason: 'primary_twitter_admin_snipe_success',
+                                matchedEntity: twitterData.handle
+                            }
+                        });
+                    }
                 }
                 return;
             }
@@ -2214,7 +1867,7 @@ async function processNewToken(tokenData, platform) {
             // Check secondary admins list
             const secondaryAdminConfig = botState.checkAdminInSecondary(twitterData.handle);
             if (secondaryAdminConfig) {
-                console.log(`🔔 Admin @${twitterData.handle} found in secondary admin list!`);
+                console.log(`🔧 Admin @${twitterData.handle} found in secondary admin list!`);
 
                 const detectedTokenData = {
                     ...completeTokenData,
@@ -2225,6 +1878,33 @@ async function processNewToken(tokenData, platform) {
                 };
 
                 botState.addDetectedToken(tokenAddress, detectedTokenData);
+
+                // Get pair data for auto-open decision
+                const pairData = await getPairAddressFromDexScreener(tokenAddress);
+
+                if (pairData && pairData.pairAddress) {
+                    // Open browser with pair address
+                    const autoOpenUrl = botState.settings.tokenPageDestination === 'axiom'
+                        ? `https://axiom.trade/meme/${pairData.pairAddress}`
+                        : `https://neo.bullx.io/terminal?chainId=1399811149&address=${tokenAddress}`;
+
+                    console.log(`🌐 Auto-opening secondary Twitter admin detection with pair: ${pairData.pairAddress}`);
+
+                    // Broadcast auto-open
+                    broadcastToClients({
+                        type: 'auto_open_token_page',
+                        data: {
+                            tokenAddress,
+                            tokenPageUrl: autoOpenUrl,
+                            destination: botState.settings.tokenPageDestination,
+                            reason: 'secondary_twitter_admin_detection',
+                            matchedEntity: twitterData.handle
+                        }
+                    });
+                } else {
+                    // Just log, don't open anything
+                    console.log(`⚠️ No pair found for ${tokenAddress} - not opening browser for secondary Twitter admin detection`);
+                }
 
                 // Trigger popup for secondary matches
                 broadcastToClients({
@@ -2249,7 +1929,120 @@ async function processNewToken(tokenData, platform) {
             }
         }
 
-        // 2. CONSOLIDATED WALLET ADDRESS CHECKING
+        // 2. Check Twitter Community ID matching
+        if (twitterData.type === 'community' && twitterData.id) {
+            console.log(`🏘️ Found Twitter community: ${twitterData.id}`);
+
+            // Check if community ID is in primary admins list
+            const primaryAdminConfig = botState.checkAdminInPrimary(twitterData.id.toString());
+            if (primaryAdminConfig) {
+                console.log(`✅ Community ID ${twitterData.id} found in primary admin list!`);
+
+                const detectedTokenData = {
+                    ...completeTokenData,
+                    matchType: 'primary_admin',
+                    matchedEntity: `Community ${twitterData.id}`,
+                    detectionReason: `Primary Community: ${twitterData.id}`,
+                    config: primaryAdminConfig
+                };
+
+                botState.addDetectedToken(tokenAddress, detectedTokenData);
+
+                // Save community to Firebase
+                await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
+
+                broadcastToClients({
+                    type: 'token_detected',
+                    data: detectedTokenData
+                });
+
+                if (!botState.settings.detectionOnlyMode) {
+                    // ✅ USE GLOBAL SETTINGS FOR SPEED
+                    const snipeResult = await snipeToken(tokenAddress, botState.settings.globalSnipeSettings);
+
+                    if (snipeResult.success && snipeResult.tokenPageUrl) {
+                        console.log('🌐 Auto-opening token page after primary community snipe...');
+                        broadcastToClients({
+                            type: 'auto_open_token_page',
+                            data: {
+                                tokenAddress,
+                                tokenPageUrl: snipeResult.tokenPageUrl,
+                                destination: botState.settings.tokenPageDestination,
+                                reason: 'primary_community_snipe_success',
+                                matchedEntity: `Community ${twitterData.id}`
+                            }
+                        });
+                    }
+                }
+                return;
+            }
+
+            // Check if community ID is in secondary admins list
+            const secondaryAdminConfig = botState.checkAdminInSecondary(twitterData.id.toString());
+            if (secondaryAdminConfig) {
+                console.log(`🔧 Community ID ${twitterData.id} found in secondary admin list!`);
+
+                const detectedTokenData = {
+                    ...completeTokenData,
+                    matchType: 'secondary_admin',
+                    matchedEntity: `Community ${twitterData.id}`,
+                    detectionReason: `Secondary Community: ${twitterData.id}`,
+                    config: secondaryAdminConfig
+                };
+
+                botState.addDetectedToken(tokenAddress, detectedTokenData);
+
+                // Save community to Firebase
+                await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
+
+                // Get pair data for auto-open decision
+                const pairData = await getPairAddressFromDexScreener(tokenAddress);
+
+                if (pairData && pairData.pairAddress) {
+                    const autoOpenUrl = botState.settings.tokenPageDestination === 'axiom'
+                        ? `https://axiom.trade/meme/${pairData.pairAddress}`
+                        : `https://neo.bullx.io/terminal?chainId=1399811149&address=${tokenAddress}`;
+
+                    console.log(`🌐 Auto-opening secondary community detection with pair: ${pairData.pairAddress}`);
+
+                    broadcastToClients({
+                        type: 'auto_open_token_page',
+                        data: {
+                            tokenAddress,
+                            tokenPageUrl: autoOpenUrl,
+                            destination: botState.settings.tokenPageDestination,
+                            reason: 'secondary_community_detection',
+                            matchedEntity: `Community ${twitterData.id}`
+                        }
+                    });
+                } else {
+                    console.log(`⚠️ No pair found for ${tokenAddress} - not opening browser for secondary community detection`);
+                }
+
+                // Trigger popup for secondary matches
+                broadcastToClients({
+                    type: 'secondary_popup_trigger',
+                    data: {
+                        tokenData: detectedTokenData,
+                        globalSnipeSettings: botState.settings.globalSnipeSettings,
+                        timestamp: new Date().toISOString()
+                    }
+                });
+
+                // Play sound notification
+                broadcastToClients({
+                    type: 'secondary_notification',
+                    data: {
+                        tokenAddress,
+                        soundNotification: secondaryAdminConfig.soundNotification,
+                        timestamp: new Date().toISOString()
+                    }
+                });
+                return;
+            }
+        }
+
+        // 3. CONSOLIDATED WALLET ADDRESS CHECKING
         if (creatorWallet) {
             console.log(`💰 Checking creator wallet: ${creatorWallet}`);
 
@@ -2274,7 +2067,23 @@ async function processNewToken(tokenData, platform) {
                 });
 
                 if (!botState.settings.detectionOnlyMode) {
-                    await snipeToken(tokenAddress, primaryAdminConfig);
+                    // ✅ USE GLOBAL SETTINGS FOR SPEED
+                    const snipeResult = await snipeToken(tokenAddress, botState.settings.globalSnipeSettings);
+
+                    // 🔥 AUTO-OPEN TOKEN PAGE AFTER SUCCESSFUL WALLET SNIPE
+                    if (snipeResult.success && snipeResult.tokenPageUrl) {
+                        console.log('🌐 Auto-opening token page after primary wallet snipe...');
+                        broadcastToClients({
+                            type: 'auto_open_token_page',
+                            data: {
+                                tokenAddress,
+                                tokenPageUrl: snipeResult.tokenPageUrl,
+                                destination: botState.settings.tokenPageDestination,
+                                reason: 'primary_wallet_snipe_success',
+                                matchedEntity: `${creatorWallet.substring(0, 8)}...`
+                            }
+                        });
+                    }
                 }
                 return;
             }
@@ -2282,7 +2091,7 @@ async function processNewToken(tokenData, platform) {
             // Check if wallet address is in secondary admins list
             const secondaryAdminConfig = botState.checkAdminInSecondary(creatorWallet);
             if (secondaryAdminConfig) {
-                console.log(`🔔 Wallet ${creatorWallet} found in secondary admin list!`);
+                console.log(`🔧 Wallet ${creatorWallet} found in secondary admin list!`);
 
                 const detectedTokenData = {
                     ...completeTokenData,
@@ -2293,6 +2102,33 @@ async function processNewToken(tokenData, platform) {
                 };
 
                 botState.addDetectedToken(tokenAddress, detectedTokenData);
+
+                // Get pair data for auto-open decision
+                const pairData = await getPairAddressFromDexScreener(tokenAddress);
+
+                if (pairData && pairData.pairAddress) {
+                    // Open browser with pair address
+                    const autoOpenUrl = botState.settings.tokenPageDestination === 'axiom'
+                        ? `https://axiom.trade/meme/${pairData.pairAddress}`
+                        : `https://neo.bullx.io/terminal?chainId=1399811149&address=${tokenAddress}`;
+
+                    console.log(`🌐 Auto-opening secondary wallet detection with pair: ${pairData.pairAddress}`);
+
+                    // Broadcast auto-open
+                    broadcastToClients({
+                        type: 'auto_open_token_page',
+                        data: {
+                            tokenAddress,
+                            tokenPageUrl: autoOpenUrl,
+                            destination: botState.settings.tokenPageDestination,
+                            reason: 'secondary_wallet_detection',
+                            matchedEntity: `${creatorWallet.substring(0, 8)}...`
+                        }
+                    });
+                } else {
+                    // Just log, don't open anything
+                    console.log(`⚠️ No pair found for ${tokenAddress} - not opening browser for secondary wallet detection`);
+                }
 
                 // Trigger popup for secondary matches
                 broadcastToClients({
@@ -2340,6 +2176,24 @@ async function processNewToken(tokenData, platform) {
             type: 'token_detected',
             data: detectedTokenData
         });
+
+        // 🔥 AUTO-OPEN IF NO FILTERS AND NOT DETECTION ONLY MODE
+        if (!botState.settings.detectionOnlyMode) {
+            const snipeResult = await snipeToken(tokenAddress, botState.settings.globalSnipeSettings);
+
+            if (snipeResult.success && snipeResult.tokenPageUrl) {
+                console.log('🌐 Auto-opening token page after no-filter snipe...');
+                broadcastToClients({
+                    type: 'auto_open_token_page',
+                    data: {
+                        tokenAddress,
+                        tokenPageUrl: snipeResult.tokenPageUrl,
+                        destination: botState.settings.tokenPageDestination,
+                        reason: 'no_filters_snipe_success'
+                    }
+                });
+            }
+        }
         return;
     }
 
@@ -2347,37 +2201,6 @@ async function processNewToken(tokenData, platform) {
 }
 
 // ========== API ENDPOINTS ==========
-app.post('/api/twitter-logout', async (req, res) => {
-    try {
-        if (!twitterScraper.isInitialized) {
-            return res.status(400).json({ 
-                success: false,
-                error: 'Twitter scraper not initialized' 
-            });
-        }
-
-        console.log('📞 API: Twitter logout requested');
-        const success = await twitterScraper.logout();
-        
-        if (success) {
-            res.json({ 
-                success: true, 
-                message: 'Successfully logged out from Twitter' 
-            });
-        } else {
-            res.json({ 
-                success: false, 
-                message: 'Logout encountered issues but session marked as inactive' 
-            });
-        }
-    } catch (error) {
-        console.error('❌ API: Twitter logout error:', error);
-        res.status(500).json({ 
-            success: false,
-            error: error.message 
-        });
-    }
-});
 
 // Global snipe settings API endpoints
 app.post('/api/global-snipe-settings', (req, res) => {
@@ -2396,12 +2219,167 @@ app.post('/api/global-snipe-settings', (req, res) => {
     });
 });
 
+app.post('/api/twitter-logout', async (req, res) => {
+    try {
+        if (!twitterScraper.isInitialized) {
+            return res.status(400).json({ error: 'Twitter scraper not initialized' });
+        }
+
+        // If browser crashed or closed, reinitialize it first
+        if (!twitterScraper.browser || !twitterScraper.page) {
+            console.log('🔄 Browser crashed, reinitializing...');
+            const initSuccess = await twitterScraper.init();
+            if (!initSuccess) {
+                return res.status(500).json({ error: 'Failed to reinitialize browser' });
+            }
+        }
+
+        let logoutSuccess = false;
+
+        // Navigate to logout page and perform logout
+        if (twitterScraper.page) {
+            try {
+                console.log('🚪 Starting Twitter logout process...');
+
+                // Step 1: Go to logout page
+                await twitterScraper.page.goto('https://twitter.com/logout', {
+                    waitUntil: 'networkidle',
+                    timeout: 30000
+                });
+
+                await twitterScraper.page.waitForTimeout(2000);
+
+                // Step 2: Try to auto-click logout confirmation
+                try {
+                    console.log('🔍 Looking for logout confirmation button...');
+                    const logoutButton = await twitterScraper.page.waitForSelector(
+                        '[data-testid="confirmationSheetConfirm"]',
+                        { timeout: 5000 }
+                    );
+
+                    if (logoutButton) {
+                        console.log('✅ Found logout button, clicking...');
+                        await logoutButton.click();
+                        await twitterScraper.page.waitForTimeout(3000);
+
+                        // Step 3: Check if we're actually logged out
+                        const currentUrl = twitterScraper.page.url();
+                        console.log('🔍 Current URL after logout:', currentUrl);
+
+                        // Look for login indicators
+                        try {
+                            await twitterScraper.page.waitForSelector('[data-testid="loginButton"]', { timeout: 5000 });
+                            console.log('✅ Login button found - logout successful');
+                            logoutSuccess = true;
+                        } catch (e) {
+                            // If login button not found, check URL
+                            if (currentUrl.includes('/login') || currentUrl.includes('/i/flow/login')) {
+                                console.log('✅ Redirected to login page - logout successful');
+                                logoutSuccess = true;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    console.log('⚠️ No logout confirmation button found');
+
+                    // Check if we're already on login page
+                    const currentUrl = twitterScraper.page.url();
+                    if (currentUrl.includes('/login')) {
+                        console.log('✅ Already on login page - logout successful');
+                        logoutSuccess = true;
+                    }
+                }
+
+                // Step 4: If auto-logout failed, try direct navigation to login
+                if (!logoutSuccess) {
+                    console.log('🔄 Auto-logout failed, trying direct login navigation...');
+                    await twitterScraper.page.goto('https://twitter.com/i/flow/login', {
+                        waitUntil: 'networkidle',
+                        timeout: 30000
+                    });
+
+                    // Check if we reached login page
+                    const finalUrl = twitterScraper.page.url();
+                    if (finalUrl.includes('/login') || finalUrl.includes('/i/flow/login')) {
+                        console.log('✅ Successfully navigated to login page');
+                        logoutSuccess = true;
+                    }
+                }
+
+            } catch (e) {
+                console.log('⚠️ Error during logout navigation:', e.message);
+            }
+        }
+
+        // Reset session state regardless of logout success
+        twitterScraper.sessionActive = false;
+
+        const message = logoutSuccess ?
+            'Successfully logged out from Twitter' :
+            'Logout page opened - please complete logout manually in browser';
+
+        res.json({
+            success: true,
+            loggedOut: logoutSuccess,
+            message: message
+        });
+
+    } catch (error) {
+        console.error('❌ Logout error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/twitter-reopen-browser', async (req, res) => {
+    try {
+        console.log('🔄 Reopening Twitter browser...');
+
+        // Close existing browser if any
+        if (twitterScraper.browser) {
+            try {
+                await twitterScraper.browser.close();
+            } catch (e) {
+                console.log('Old browser already closed');
+            }
+        }
+
+        // Reinitialize
+        const initSuccess = await twitterScraper.init();
+        if (initSuccess) {
+            // Open Twitter login page
+            await twitterScraper.openLoginPage();
+            res.json({
+                success: true,
+                message: 'Browser reopened and Twitter login page loaded'
+            });
+        } else {
+            res.status(500).json({ error: 'Failed to reopen browser' });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.post('/api/snipe-with-global-settings/:tokenAddress', async (req, res) => {
     const { tokenAddress } = req.params;
     const globalSettings = botState.settings.globalSnipeSettings;
 
     try {
         const result = await snipeToken(tokenAddress, globalSettings);
+
+        if (result.success) {
+            // 🔥 BROADCAST AUTO-OPEN MESSAGE
+            broadcastToClients({
+                type: 'auto_open_token_page',
+                data: {
+                    tokenAddress,
+                    tokenPageUrl: result.tokenPageUrl,
+                    destination: botState.settings.tokenPageDestination,
+                    reason: 'manual_secondary_snipe'
+                }
+            });
+        }
+
         res.json({ success: true, result });
     } catch (error) {
         res.status(500).json({ error: error.message });
