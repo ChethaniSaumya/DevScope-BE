@@ -26,6 +26,8 @@
     "firebase-admin": "^13.4.0",
     "multer": "^2.0.2",
     "node-fetch": "^3.3.2",
+    "playwright": "^1.54.2",
+    "user-agents": "^1.1.632",
     "ws": "^8.18.0"
   },
   "devDependencies": {
