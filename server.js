@@ -231,6 +231,8 @@ function getMimeType(ext) {
 // ========== ORIGINAL BOTSTATE CLASS ==========
 
 // ADD THIS TWITTER SCRAPER CLASS
+// ========== COMPLETE TwitterCommunityAdminScraper CLASS WITH AUTO-HEADLESS ==========
+
 class TwitterCommunityAdminScraper {
     constructor() {
         this.browser = null;
@@ -239,20 +241,33 @@ class TwitterCommunityAdminScraper {
         this.sessionActive = false;
         this.isInitialized = false;
         this.sessionPersistentDataDir = './session/twitter-session';
+        this.isHeadless = false; // Track current mode
+        this.loginDetectionInterval = null; // For checking login status
     }
 
     async init() {
         if (this.isInitialized) return true;
 
         try {
-            console.log('🤖 Initializing Twitter scraper with persistent session...');
+            console.log('🤖 Initializing Twitter scraper...');
 
             await this.ensureDirectories();
             const userAgent = new UserAgent({ deviceCategory: 'desktop' });
 
-            // Launch browser with persistent session
+            // Check if we already have a valid session
+            const hasValidSession = await this.checkExistingSession();
+
+            if (hasValidSession) {
+                console.log('✅ Valid session found - starting in HEADLESS mode');
+                this.isHeadless = true;
+            } else {
+                console.log('⚠️ No valid session - starting in VISIBLE mode for login');
+                this.isHeadless = false;
+            }
+
+            // Launch browser with appropriate mode
             this.browser = await chromium.launchPersistentContext(this.sessionPersistentDataDir, {
-                headless: false, // Keep visible so admin can login manually
+                headless: this.isHeadless, // Dynamic headless mode
                 userAgent: userAgent.toString(),
                 viewport: { width: 1366, height: 768 },
                 args: [
@@ -266,14 +281,23 @@ class TwitterCommunityAdminScraper {
                 ]
             });
 
-            // Get the default page (browser will open)
             const pages = this.browser.pages();
             this.page = pages[0] || await this.browser.newPage();
 
             this.isInitialized = true;
-            console.log('✅ Twitter scraper initialized with persistent session');
-            console.log('🔗 Browser opened - admin can now login to Twitter manually');
-            
+
+            if (this.isHeadless) {
+                console.log('✅ Twitter scraper initialized in HEADLESS mode - ready to scrape');
+                this.sessionActive = true;
+            } else {
+                console.log('👁️ Twitter scraper initialized in VISIBLE mode - please login manually');
+                console.log('🔗 Opening Twitter login page...');
+                await this.page.goto('https://twitter.com/login');
+
+                // Start monitoring for successful login
+                this.startLoginDetection();
+            }
+
             return true;
         } catch (error) {
             console.error('❌ Failed to initialize Twitter scraper:', error);
@@ -281,17 +305,183 @@ class TwitterCommunityAdminScraper {
         }
     }
 
-    async ensureDirectories() {
+    // Check if we have existing valid session data
+    async checkExistingSession() {
         try {
-            await fs.access('./session');
-        } catch {
-            await fs.mkdir('./session', { recursive: true });
+            const fs = require('fs').promises;
+
+            // Check if session directory exists and has data
+            const sessionDir = this.sessionPersistentDataDir;
+
+            try {
+                const files = await fs.readdir(sessionDir);
+                const hasSessionFiles = files.some(file =>
+                    file.includes('cookies') ||
+                    file.includes('localStorage') ||
+                    file.includes('sessionStorage') ||
+                    file.includes('Local Storage')
+                );
+
+                if (hasSessionFiles) {
+                    console.log('🔍 Found existing session files');
+                    return true;
+                }
+            } catch (dirError) {
+                console.log('📁 No existing session directory found');
+            }
+
+            return false;
+        } catch (error) {
+            console.error('❌ Error checking existing session:', error);
+            return false;
         }
-        
+    }
+
+    // Start monitoring for successful login
+    startLoginDetection() {
+        console.log('👀 Starting login detection monitoring...');
+
+        this.loginDetectionInterval = setInterval(async () => {
+            try {
+                const isLoggedIn = await this.checkIfLoggedIn();
+
+                if (isLoggedIn) {
+                    console.log('🎉 LOGIN DETECTED! Switching to headless mode...');
+                    clearInterval(this.loginDetectionInterval);
+                    this.loginDetectionInterval = null;
+
+                    // Switch to headless mode
+                    await this.switchToHeadlessMode();
+                }
+            } catch (error) {
+                console.error('❌ Error during login detection:', error);
+            }
+        }, 3000); // Check every 3 seconds
+    }
+
+    // Check if user is logged in
+    async checkIfLoggedIn() {
         try {
-            await fs.access(this.sessionPersistentDataDir);
-        } catch {
-            await fs.mkdir(this.sessionPersistentDataDir, { recursive: true });
+            const currentUrl = this.page.url();
+            console.log(`🔍 Login check - Current URL: ${currentUrl}`);
+
+            // Check URL indicators
+            if (currentUrl.includes('home') ||
+                currentUrl.includes('timeline') ||
+                (currentUrl.includes('twitter.com') && !currentUrl.includes('login'))) {
+                console.log('✅ URL indicates login success');
+                return true;
+            }
+
+            // Check for logged-in elements
+            const loggedInSelectors = [
+                '[data-testid="SideNav_NewTweet_Button"]',
+                '[aria-label="Home timeline"]',
+                '[data-testid="AppTabBar_Home_Link"]',
+                '[data-testid="primaryColumn"]'
+            ];
+
+            for (const selector of loggedInSelectors) {
+                try {
+                    const element = await this.page.waitForSelector(selector, { timeout: 1000 });
+                    if (element) {
+                        console.log(`✅ Found logged-in element: ${selector}`);
+                        return true;
+                    }
+                } catch (e) {
+                    // Element not found, continue checking
+                }
+            }
+
+            return false;
+        } catch (error) {
+            console.error('❌ Error checking login status:', error);
+            return false;
+        }
+    }
+
+    // Switch from visible to headless mode
+    async switchToHeadlessMode() {
+        try {
+            console.log('🔄 SWITCHING TO HEADLESS MODE...');
+
+            // Close the visible browser
+            if (this.browser) {
+                console.log('🔒 Closing visible browser...');
+                await this.browser.close();
+            }
+
+            // Wait a moment for session to be saved
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
+            // Launch new headless browser with same session
+            console.log('🤖 Launching headless browser...');
+            const userAgent = new UserAgent({ deviceCategory: 'desktop' });
+
+            this.browser = await chromium.launchPersistentContext(this.sessionPersistentDataDir, {
+                headless: true, // NOW HEADLESS
+                userAgent: userAgent.toString(),
+                viewport: { width: 1366, height: 768 },
+                args: [
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-web-security',
+                    '--disable-features=VizDisplayCompositor',
+                    '--disable-extensions',
+                    '--no-first-run',
+                    '--disable-default-apps'
+                ]
+            });
+
+            const pages = this.browser.pages();
+            this.page = pages[0] || await this.browser.newPage();
+
+            this.isHeadless = true;
+            this.sessionActive = true;
+
+            console.log('✅ SUCCESSFULLY SWITCHED TO HEADLESS MODE');
+            console.log('👻 Browser is now invisible and ready for scraping');
+
+            // Verify session works in headless mode
+            const sessionCheck = await this.checkSessionStatus();
+            if (sessionCheck.loggedIn) {
+                console.log('🎯 Headless session verified - ready to scrape communities!');
+
+                // Broadcast success to frontend
+                broadcastToClients({
+                    type: 'twitter_session_switched_headless',
+                    data: {
+                        success: true,
+                        message: 'Browser switched to headless mode - ready for invisible scraping',
+                        mode: 'headless',
+                        timestamp: new Date().toISOString()
+                    }
+                });
+
+            } else {
+                console.log('⚠️ Session verification failed in headless mode');
+
+                broadcastToClients({
+                    type: 'twitter_session_switch_failed',
+                    data: {
+                        success: false,
+                        message: 'Failed to verify session in headless mode',
+                        timestamp: new Date().toISOString()
+                    }
+                });
+            }
+
+        } catch (error) {
+            console.error('❌ Failed to switch to headless mode:', error);
+
+            broadcastToClients({
+                type: 'twitter_session_switch_error',
+                data: {
+                    success: false,
+                    error: error.message,
+                    timestamp: new Date().toISOString()
+                }
+            });
         }
     }
 
@@ -302,9 +492,18 @@ class TwitterCommunityAdminScraper {
 
         try {
             const currentUrl = this.page.url();
-            console.log(`🔍 Current page URL: ${currentUrl}`);
+            console.log(`🔍 Session check - Current URL: ${currentUrl} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
 
-            // Check if we're logged in by looking for common logged-in indicators
+            // Navigate to home to check session (works in both modes)
+            try {
+                await this.page.goto('https://twitter.com/home', { waitUntil: 'networkidle' });
+            } catch (navError) {
+                console.log('Navigation error, checking current page...');
+            }
+
+            const newUrl = this.page.url();
+
+            // Check for logged-in indicators
             const loggedInIndicators = [
                 '[data-testid="SideNav_NewTweet_Button"]',
                 '[aria-label="Home timeline"]',
@@ -316,102 +515,84 @@ class TwitterCommunityAdminScraper {
                 try {
                     const element = await this.page.waitForSelector(indicator, { timeout: 2000 });
                     if (element) {
-                        console.log('✅ Twitter session is active (found logged-in indicator)');
+                        console.log(`✅ Session active (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}) - found: ${indicator}`);
                         this.sessionActive = true;
-                        return { loggedIn: true, url: currentUrl };
+                        return { loggedIn: true, url: newUrl, mode: this.isHeadless ? 'headless' : 'visible' };
                     }
                 } catch (e) {
                     // Continue checking other indicators
                 }
             }
 
-            // If no indicators found, check URL patterns
-            if (currentUrl.includes('home') || currentUrl.includes('timeline') || 
-                (currentUrl.includes('twitter.com') && !currentUrl.includes('login'))) {
-                console.log('✅ Twitter session appears active (based on URL)');
+            // Check URL patterns
+            if (newUrl.includes('home') || newUrl.includes('timeline') ||
+                (newUrl.includes('twitter.com') && !newUrl.includes('login'))) {
+                console.log(`✅ Session appears active (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}) based on URL`);
                 this.sessionActive = true;
-                return { loggedIn: true, url: currentUrl };
+                return { loggedIn: true, url: newUrl, mode: this.isHeadless ? 'headless' : 'visible' };
             }
 
-            console.log('❌ Twitter session not active');
+            console.log(`❌ Session not active (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
             this.sessionActive = false;
-            return { loggedIn: false, url: currentUrl };
+            return { loggedIn: false, url: newUrl, mode: this.isHeadless ? 'headless' : 'visible' };
 
         } catch (error) {
-            console.error('❌ Error checking session status:', error);
-            return { loggedIn: false, error: error.message };
-        }
-    }
-
-    async openLoginPage() {
-        if (!this.page) {
-            throw new Error('Browser not initialized');
-        }
-
-        try {
-            console.log('🔗 Opening Twitter login page for manual login...');
-            await this.page.goto('https://twitter.com/login');
-            console.log('✅ Twitter login page opened - admin can now login manually');
-            return true;
-        } catch (error) {
-            console.error('❌ Failed to open login page:', error);
-            return false;
+            console.error(`❌ Error checking session status (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}):`, error);
+            return { loggedIn: false, error: error.message, mode: this.isHeadless ? 'headless' : 'visible' };
         }
     }
 
     async scrapeCommunityAdmins(communityId) {
-        console.log(`🎯 Scraping admins from community: ${communityId}`);
+        console.log(`🎯 Scraping admins from community: ${communityId} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'} MODE)`);
 
         // Check if session is active first
         const sessionStatus = await this.checkSessionStatus();
         if (!sessionStatus.loggedIn) {
-            console.log('❌ Twitter session not active. Admin needs to login manually.');
-            throw new Error('Twitter session not active. Please login manually first.');
+            console.log(`❌ Session not active in ${this.isHeadless ? 'headless' : 'visible'} mode. Login required.`);
+            throw new Error(`Twitter session not active. Please login ${this.isHeadless ? 'again' : 'manually'}.`);
         }
 
         const moderatorsUrl = `https://x.com/i/communities/${communityId}/moderators`;
 
         try {
-            console.log(`🌐 Navigating to: ${moderatorsUrl}`);
+            console.log(`🌐 Navigating to: ${moderatorsUrl} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
             await this.page.goto(moderatorsUrl);
             await this.page.waitForTimeout(5000);
 
             // Check if we got redirected to login (session expired)
             const currentUrl = this.page.url();
             if (currentUrl.includes('login')) {
-                console.log('❌ Redirected to login - session expired');
-                throw new Error('Session expired. Please login manually again.');
+                console.log(`❌ Redirected to login - session expired in ${this.isHeadless ? 'headless' : 'visible'} mode`);
+                throw new Error('Session expired. Please login again.');
             }
 
             // PRIMARY METHOD: Screenshot + Text Analysis
-            console.log('📸 Using screenshot method (primary)...');
+            console.log(`📸 Using screenshot method (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
             const screenshotAdmins = await this.extractAdminsFromScreenshot(communityId);
 
             if (screenshotAdmins.length > 0) {
-                console.log(`✅ Screenshot method found ${screenshotAdmins.length} admin(s)`);
+                console.log(`✅ Screenshot method found ${screenshotAdmins.length} admin(s) (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
                 return screenshotAdmins;
             }
 
             // BACKUP METHOD: DOM Scraping (only if screenshot fails)
-            console.log('⚠️ Screenshot method failed, trying DOM scraping...');
+            console.log(`⚠️ Screenshot method failed, trying DOM scraping (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
             const domAdmins = await this.extractAdminsFromDOM();
 
-            console.log(`✅ Found ${domAdmins.length} admin(s) using backup DOM method`);
+            console.log(`✅ Found ${domAdmins.length} admin(s) using DOM method (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
             return domAdmins;
 
         } catch (error) {
-            console.error(`❌ Failed to scrape community ${communityId}:`, error);
+            console.error(`❌ Failed to scrape community ${communityId} in ${this.isHeadless ? 'headless' : 'visible'} mode:`, error);
             return [];
         }
     }
 
-    // Keep all your existing parsing methods unchanged
     parseAdminsFromText(pageText) {
-        // ... your existing code unchanged
         const lines = pageText.split('\n');
         const admins = [];
 
-        console.log('🔍 Analyzing text for admin patterns...');
+        console.log(`🔍 Analyzing text for admin patterns (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
 
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i].trim();
@@ -423,19 +604,19 @@ class TwitterCommunityAdminScraper {
                     admins.push({
                         username: prevLine,
                         badgeType: 'Admin',
-                        source: 'text_analysis',
+                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
                         pattern: 'username_before_admin'
                     });
-                    console.log(`👑 Found admin: @${prevLine} (pattern: username before Admin)`);
+                    console.log(`👑 Found admin: @${prevLine} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
                 }
                 else if (nextLine && /^[a-zA-Z0-9_]{1,15}$/.test(nextLine)) {
                     admins.push({
                         username: nextLine,
                         badgeType: 'Admin',
-                        source: 'text_analysis',
+                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
                         pattern: 'username_after_admin'
                     });
-                    console.log(`👑 Found admin: @${nextLine} (pattern: username after Admin)`);
+                    console.log(`👑 Found admin: @${nextLine} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
                 }
             }
             else if (line === 'Mod') {
@@ -443,19 +624,19 @@ class TwitterCommunityAdminScraper {
                     admins.push({
                         username: prevLine,
                         badgeType: 'Mod',
-                        source: 'text_analysis',
+                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
                         pattern: 'username_before_mod'
                     });
-                    console.log(`🛡️ Found mod: @${prevLine} (pattern: username before Mod)`);
+                    console.log(`🛡️ Found mod: @${prevLine} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
                 }
                 else if (nextLine && /^[a-zA-Z0-9_]{1,15}$/.test(nextLine)) {
                     admins.push({
                         username: nextLine,
                         badgeType: 'Mod',
-                        source: 'text_analysis',
+                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
                         pattern: 'username_after_mod'
                     });
-                    console.log(`🛡️ Found mod: @${nextLine} (pattern: username after Mod)`);
+                    console.log(`🛡️ Found mod: @${nextLine} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
                 }
             }
             else if (line.startsWith('@')) {
@@ -465,16 +646,16 @@ class TwitterCommunityAdminScraper {
 
                     if (prevLine === 'Admin' || nextLine === 'Admin') {
                         badgeType = 'Admin';
-                        console.log(`👑 Found admin: @${username} (pattern: @username with Admin badge)`);
+                        console.log(`👑 Found admin: @${username} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
                     } else if (prevLine === 'Mod' || nextLine === 'Mod') {
                         badgeType = 'Mod';
-                        console.log(`🛡️ Found mod: @${username} (pattern: @username with Mod badge)`);
+                        console.log(`🛡️ Found mod: @${username} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
                     }
 
                     admins.push({
                         username: username,
                         badgeType: badgeType,
-                        source: 'text_analysis',
+                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
                         pattern: '@username_format'
                     });
                 }
@@ -489,12 +670,12 @@ class TwitterCommunityAdminScraper {
                         if (nearbyLine === 'Admin') {
                             badgeType = 'Admin';
                             pattern = 'username_near_admin';
-                            console.log(`👑 Found admin: @${line} (pattern: username near Admin)`);
+                            console.log(`👑 Found admin: @${line} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
                             break;
                         } else if (nearbyLine === 'Mod') {
                             badgeType = 'Mod';
                             pattern = 'username_near_mod';
-                            console.log(`🛡️ Found mod: @${line} (pattern: username near Mod)`);
+                            console.log(`🛡️ Found mod: @${line} (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
                             break;
                         }
                     }
@@ -504,7 +685,7 @@ class TwitterCommunityAdminScraper {
                     admins.push({
                         username: line,
                         badgeType: badgeType,
-                        source: 'text_analysis',
+                        source: `${this.isHeadless ? 'headless' : 'visible'}_text_analysis`,
                         pattern: pattern
                     });
                 }
@@ -519,17 +700,16 @@ class TwitterCommunityAdminScraper {
             return 0;
         });
 
-        console.log(`🎯 Final unique admins found: ${uniqueAdmins.length}`);
+        console.log(`🎯 Final unique admins found (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}): ${uniqueAdmins.length}`);
         return uniqueAdmins;
     }
 
     async extractAdminsFromScreenshot(communityId) {
-        // ... your existing code unchanged
-        console.log('📸 Taking screenshot and analyzing text...');
+        console.log(`📸 Taking screenshot and analyzing text (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
 
         try {
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const screenshotFileName = `community_${communityId}_${timestamp}.png`;
+            const screenshotFileName = `community_${communityId}_${this.isHeadless ? 'headless' : 'visible'}_${timestamp}.png`;
             const screenshotPath = `./output/${screenshotFileName}`;
 
             await this.ensureOutputDirectory();
@@ -540,31 +720,30 @@ class TwitterCommunityAdminScraper {
                 type: 'png'
             });
 
-            console.log(`📸 Screenshot saved: ${screenshotPath}`);
+            console.log(`📸 Screenshot saved (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}): ${screenshotPath}`);
 
             const pageText = await this.page.evaluate(() => {
                 return document.body.innerText;
             });
 
-            const textFileName = `community_${communityId}_text_${timestamp}.txt`;
+            const textFileName = `community_${communityId}_${this.isHeadless ? 'headless' : 'visible'}_text_${timestamp}.txt`;
             const textPath = `./output/${textFileName}`;
             await this.saveTextFile(textPath, pageText);
 
             const admins = this.parseAdminsFromText(pageText);
 
-            console.log(`📝 Text analysis found ${admins.length} admin(s)`);
+            console.log(`🔍 Text analysis found ${admins.length} admin(s) (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})`);
 
             return admins;
 
         } catch (error) {
-            console.error('❌ Screenshot method failed:', error);
+            console.error(`❌ Screenshot method failed (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'}):`, error);
             return [];
         }
     }
 
     async extractAdminsFromDOM() {
-        // ... your existing code unchanged
-        console.log('🔧 Using DOM scraping (backup method)...');
+        console.log(`🔧 Using DOM scraping (${this.isHeadless ? 'HEADLESS' : 'VISIBLE'})...`);
 
         return await this.page.evaluate(() => {
             const userCells = document.querySelectorAll('div[data-testid="UserCell"]');
@@ -605,13 +784,39 @@ class TwitterCommunityAdminScraper {
     }
 
     async close() {
+        // Clear login detection interval
+        if (this.loginDetectionInterval) {
+            clearInterval(this.loginDetectionInterval);
+            this.loginDetectionInterval = null;
+            console.log('🔄 Login detection monitoring stopped');
+        }
+
         if (this.browser) {
             await this.browser.close();
             this.isInitialized = false;
+            console.log(`✅ Browser closed (was in ${this.isHeadless ? 'HEADLESS' : 'VISIBLE'} mode)`);
+        }
+    }
+
+    async ensureDirectories() {
+        const fs = require('fs').promises;
+
+        try {
+            await fs.access('./session');
+        } catch {
+            await fs.mkdir('./session', { recursive: true });
+        }
+
+        try {
+            await fs.access(this.sessionPersistentDataDir);
+        } catch {
+            await fs.mkdir(this.sessionPersistentDataDir, { recursive: true });
         }
     }
 
     async ensureOutputDirectory() {
+        const fs = require('fs').promises;
+
         try {
             await fs.access('./output');
         } catch {
@@ -621,9 +826,11 @@ class TwitterCommunityAdminScraper {
     }
 
     async saveTextFile(filePath, content) {
+        const fs = require('fs').promises;
+
         try {
             await fs.writeFile(filePath, content, 'utf8');
-            console.log(`📝 Text saved: ${filePath}`);
+            console.log(`📁 Text saved: ${filePath}`);
         } catch (error) {
             console.error('❌ Failed to save text file:', error);
         }
@@ -1349,7 +1556,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
         const primaryAdminConfig = botState.checkAdminInPrimary(communityIdStr);
         if (primaryAdminConfig) {
             console.log(`🎯 Community ID ${communityId} found directly in PRIMARY admin list!`);
-            
+
             // Broadcast to frontend
             broadcastToClients({
                 type: 'community_id_match_found',
@@ -1376,7 +1583,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
         const secondaryAdminConfig = botState.checkAdminInSecondary(communityIdStr);
         if (secondaryAdminConfig) {
             console.log(`🔔 Community ID ${communityId} found directly in SECONDARY admin list!`);
-            
+
             // Broadcast to frontend
             broadcastToClients({
                 type: 'community_id_match_found',
@@ -1408,7 +1615,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
             const initSuccess = await twitterScraper.init();
             if (!initSuccess) {
                 console.log(`❌ Failed to initialize Twitter scraper, using community ID fallback`);
-                
+
                 // Broadcast initialization failure
                 broadcastToClients({
                     type: 'community_scraping_failed',
@@ -1423,7 +1630,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
                         yourSecondaryList: Array.from(botState.secondaryAdminList.values()).map(item => item.address)
                     }
                 });
-                
+
                 return null;
             }
         }
@@ -1434,7 +1641,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
 
         if (!sessionStatus.loggedIn) {
             console.log(`❌ Twitter session not active: ${sessionStatus.error || 'Not logged in'}`);
-            
+
             // Broadcast session not active
             broadcastToClients({
                 type: 'community_scraping_failed',
@@ -1451,7 +1658,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
                     needsManualLogin: true
                 }
             });
-            
+
             return null;
         }
 
@@ -1463,7 +1670,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
 
         if (communityAdmins.length === 0) {
             console.log(`⚠️ No admins found in community ${communityId}`);
-            
+
             // Broadcast no admins found
             broadcastToClients({
                 type: 'community_scraping_failed',
@@ -1478,7 +1685,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
                     yourSecondaryList: Array.from(botState.secondaryAdminList.values()).map(item => item.address)
                 }
             });
-            
+
             return null;
         }
 
@@ -1649,7 +1856,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
     } catch (error) {
         console.error(`❌ Error scraping community ${communityId}:`, error);
         console.error(`📋 Error details:`, error.message);
-        
+
         // Broadcast error
         broadcastToClients({
             type: 'community_scraping_error',
@@ -1660,7 +1867,7 @@ async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
                 fallbackUsed: true
             }
         });
-        
+
         return null;
     }
 }
@@ -3054,9 +3261,9 @@ app.post('/api/twitter-open-login', async (req, res) => {
 
         const success = await twitterScraper.openLoginPage();
         if (success) {
-            res.json({ 
-                success: true, 
-                message: 'Login page opened. Please login manually in the browser window.' 
+            res.json({
+                success: true,
+                message: 'Login page opened. Please login manually in the browser window.'
             });
         } else {
             res.status(500).json({ error: 'Failed to open login page' });
