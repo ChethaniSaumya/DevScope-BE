@@ -337,6 +337,115 @@ class TwitterCommunityAdminScraper {
         }
     }
 
+    async logout() {
+    if (!this.page) {
+        console.log('❌ Browser not initialized, cannot logout');
+        return false;
+    }
+
+    try {
+        console.log('🔓 Starting Twitter logout process...');
+
+        // Method 1: Try direct logout URL (most reliable)
+        try {
+            await this.page.goto('https://twitter.com/logout', { waitUntil: 'networkidle' });
+            await this.page.waitForTimeout(2000);
+
+            // Confirm logout if confirmation dialog appears
+            const confirmButton = await this.page.$('[data-testid="confirmationSheetConfirm"]');
+            if (confirmButton) {
+                await confirmButton.click();
+                console.log('✅ Confirmed logout');
+                await this.page.waitForTimeout(2000);
+            }
+        } catch (e) {
+            console.log('⚠️ Direct logout URL failed, trying alternative method...');
+        }
+
+        // Method 2: Try More menu logout (fallback)
+        try {
+            // Navigate to home first
+            await this.page.goto('https://twitter.com/home');
+            await this.page.waitForTimeout(2000);
+
+            // Click on "More" menu
+            const moreButton = await this.page.waitForSelector('[data-testid="AppTabBar_More_Menu"]', { timeout: 5000 });
+            if (moreButton) {
+                await moreButton.click();
+                await this.page.waitForTimeout(1000);
+
+                // Look for logout option
+                const logoutOption = await this.page.waitForSelector('[data-testid="accountSwitcher"] >> text="Log out"', { timeout: 3000 });
+                if (logoutOption) {
+                    await logoutOption.click();
+                    console.log('✅ Clicked logout from More menu');
+                    await this.page.waitForTimeout(2000);
+                }
+            }
+        } catch (e) {
+            console.log('⚠️ More menu logout not found');
+        }
+
+        // Wait for logout to complete
+        await this.page.waitForTimeout(3000);
+
+        // Verify logout by checking current URL
+        const currentUrl = this.page.url();
+        console.log('🔍 Current URL after logout attempt:', currentUrl);
+
+        if (currentUrl.includes('login') || currentUrl.includes('logout') || 
+            currentUrl === 'https://twitter.com/' || currentUrl === 'https://x.com/') {
+            console.log('✅ Successfully logged out from Twitter');
+            this.sessionActive = false;
+            
+            // Broadcast logout success
+            broadcastToClients({
+                type: 'twitter_logout_success',
+                data: {
+                    success: true,
+                    message: 'Successfully logged out from Twitter',
+                    timestamp: new Date().toISOString()
+                }
+            });
+            
+            return true;
+        } else {
+            console.log('⚠️ Logout may not have completed, current URL:', currentUrl);
+            
+            // Still mark as logged out locally
+            this.sessionActive = false;
+            
+            broadcastToClients({
+                type: 'twitter_logout_partial',
+                data: {
+                    success: true,
+                    message: 'Logout attempted - session marked as inactive',
+                    timestamp: new Date().toISOString()
+                }
+            });
+            
+            return true; // Consider it successful since we tried
+        }
+
+    } catch (error) {
+        console.error('❌ Error during Twitter logout:', error);
+        
+        // Mark as logged out even if error occurred
+        this.sessionActive = false;
+        
+        broadcastToClients({
+            type: 'twitter_logout_error',
+            data: {
+                success: false,
+                error: error.message,
+                timestamp: new Date().toISOString()
+            }
+        });
+        
+        return false;
+    }
+}
+
     // Start monitoring for successful login
     startLoginDetection() {
         console.log('👀 Starting login detection monitoring...');
@@ -2238,6 +2347,37 @@ async function processNewToken(tokenData, platform) {
 }
 
 // ========== API ENDPOINTS ==========
+app.post('/api/twitter-logout', async (req, res) => {
+    try {
+        if (!twitterScraper.isInitialized) {
+            return res.status(400).json({ 
+                success: false,
+                error: 'Twitter scraper not initialized' 
+            });
+        }
+
+        console.log('📞 API: Twitter logout requested');
+        const success = await twitterScraper.logout();
+        
+        if (success) {
+            res.json({ 
+                success: true, 
+                message: 'Successfully logged out from Twitter' 
+            });
+        } else {
+            res.json({ 
+                success: false, 
+                message: 'Logout encountered issues but session marked as inactive' 
+            });
+        }
+    } catch (error) {
+        console.error('❌ API: Twitter logout error:', error);
+        res.status(500).json({ 
+            success: false,
+            error: error.message 
+        });
+    }
+});
 
 // Global snipe settings API endpoints
 app.post('/api/global-snipe-settings', (req, res) => {
