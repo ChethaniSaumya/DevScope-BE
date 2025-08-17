@@ -12,6 +12,9 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs').promises;
 
+const { chromium } = require('playwright');
+const UserAgent = require('user-agents');
+
 dotenv.config();
 
 // Initialize Firebase Admin SDK
@@ -47,6 +50,20 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const HELIUS_RPC = process.env.HELIUS_RPC || "https://mainnet.helius-rpc.com/?api-key=82e3e020-5346-402d-a9ec-ab6e0bc4a5e9";
 const PUMP_PORTAL_API_KEY = process.env.PUMP_PORTAL_API_KEY;
+
+// ADD THIS TWITTER CONFIG
+const TWITTER_CONFIG = {
+    username: process.env.TWITTER_USERNAME,
+    password: process.env.TWITTER_PASSWORD,
+    sessionDir: './session',
+    cookiesPath: './session/twitter-cookies.json',
+    sessionDurationHours: 24,
+    timeouts: {
+        navigation: 30000,
+        selector: 10000,
+        action: 5000
+    }
+};
 
 const connection = new Connection(HELIUS_RPC, {
     commitment: 'processed',
@@ -213,6 +230,409 @@ function getMimeType(ext) {
 
 // ========== ORIGINAL BOTSTATE CLASS ==========
 
+// ADD THIS TWITTER SCRAPER CLASS
+class TwitterCommunityAdminScraper {
+    constructor() {
+        this.browser = null;
+        this.context = null;
+        this.page = null;
+        this.sessionActive = false;
+        this.isInitialized = false;
+        this.sessionPersistentDataDir = './session/twitter-session';
+    }
+
+    async init() {
+        if (this.isInitialized) return true;
+
+        try {
+            console.log('🤖 Initializing Twitter scraper with persistent session...');
+
+            await this.ensureDirectories();
+            const userAgent = new UserAgent({ deviceCategory: 'desktop' });
+
+            // Launch browser with persistent session
+            this.browser = await chromium.launchPersistentContext(this.sessionPersistentDataDir, {
+                headless: false, // Keep visible so admin can login manually
+                userAgent: userAgent.toString(),
+                viewport: { width: 1366, height: 768 },
+                args: [
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-web-security',
+                    '--disable-features=VizDisplayCompositor',
+                    '--disable-extensions',
+                    '--no-first-run',
+                    '--disable-default-apps'
+                ]
+            });
+
+            // Get the default page (browser will open)
+            const pages = this.browser.pages();
+            this.page = pages[0] || await this.browser.newPage();
+
+            this.isInitialized = true;
+            console.log('✅ Twitter scraper initialized with persistent session');
+            console.log('🔗 Browser opened - admin can now login to Twitter manually');
+            
+            return true;
+        } catch (error) {
+            console.error('❌ Failed to initialize Twitter scraper:', error);
+            return false;
+        }
+    }
+
+    async ensureDirectories() {
+        try {
+            await fs.access('./session');
+        } catch {
+            await fs.mkdir('./session', { recursive: true });
+        }
+        
+        try {
+            await fs.access(this.sessionPersistentDataDir);
+        } catch {
+            await fs.mkdir(this.sessionPersistentDataDir, { recursive: true });
+        }
+    }
+
+    async checkSessionStatus() {
+        if (!this.page) {
+            return { loggedIn: false, error: 'Browser not initialized' };
+        }
+
+        try {
+            const currentUrl = this.page.url();
+            console.log(`🔍 Current page URL: ${currentUrl}`);
+
+            // Check if we're logged in by looking for common logged-in indicators
+            const loggedInIndicators = [
+                '[data-testid="SideNav_NewTweet_Button"]',
+                '[aria-label="Home timeline"]',
+                '[data-testid="AppTabBar_Home_Link"]',
+                '[data-testid="primaryColumn"]'
+            ];
+
+            for (const indicator of loggedInIndicators) {
+                try {
+                    const element = await this.page.waitForSelector(indicator, { timeout: 2000 });
+                    if (element) {
+                        console.log('✅ Twitter session is active (found logged-in indicator)');
+                        this.sessionActive = true;
+                        return { loggedIn: true, url: currentUrl };
+                    }
+                } catch (e) {
+                    // Continue checking other indicators
+                }
+            }
+
+            // If no indicators found, check URL patterns
+            if (currentUrl.includes('home') || currentUrl.includes('timeline') || 
+                (currentUrl.includes('twitter.com') && !currentUrl.includes('login'))) {
+                console.log('✅ Twitter session appears active (based on URL)');
+                this.sessionActive = true;
+                return { loggedIn: true, url: currentUrl };
+            }
+
+            console.log('❌ Twitter session not active');
+            this.sessionActive = false;
+            return { loggedIn: false, url: currentUrl };
+
+        } catch (error) {
+            console.error('❌ Error checking session status:', error);
+            return { loggedIn: false, error: error.message };
+        }
+    }
+
+    async openLoginPage() {
+        if (!this.page) {
+            throw new Error('Browser not initialized');
+        }
+
+        try {
+            console.log('🔗 Opening Twitter login page for manual login...');
+            await this.page.goto('https://twitter.com/login');
+            console.log('✅ Twitter login page opened - admin can now login manually');
+            return true;
+        } catch (error) {
+            console.error('❌ Failed to open login page:', error);
+            return false;
+        }
+    }
+
+    async scrapeCommunityAdmins(communityId) {
+        console.log(`🎯 Scraping admins from community: ${communityId}`);
+
+        // Check if session is active first
+        const sessionStatus = await this.checkSessionStatus();
+        if (!sessionStatus.loggedIn) {
+            console.log('❌ Twitter session not active. Admin needs to login manually.');
+            throw new Error('Twitter session not active. Please login manually first.');
+        }
+
+        const moderatorsUrl = `https://x.com/i/communities/${communityId}/moderators`;
+
+        try {
+            console.log(`🌐 Navigating to: ${moderatorsUrl}`);
+            await this.page.goto(moderatorsUrl);
+            await this.page.waitForTimeout(5000);
+
+            // Check if we got redirected to login (session expired)
+            const currentUrl = this.page.url();
+            if (currentUrl.includes('login')) {
+                console.log('❌ Redirected to login - session expired');
+                throw new Error('Session expired. Please login manually again.');
+            }
+
+            // PRIMARY METHOD: Screenshot + Text Analysis
+            console.log('📸 Using screenshot method (primary)...');
+            const screenshotAdmins = await this.extractAdminsFromScreenshot(communityId);
+
+            if (screenshotAdmins.length > 0) {
+                console.log(`✅ Screenshot method found ${screenshotAdmins.length} admin(s)`);
+                return screenshotAdmins;
+            }
+
+            // BACKUP METHOD: DOM Scraping (only if screenshot fails)
+            console.log('⚠️ Screenshot method failed, trying DOM scraping...');
+            const domAdmins = await this.extractAdminsFromDOM();
+
+            console.log(`✅ Found ${domAdmins.length} admin(s) using backup DOM method`);
+            return domAdmins;
+
+        } catch (error) {
+            console.error(`❌ Failed to scrape community ${communityId}:`, error);
+            return [];
+        }
+    }
+
+    // Keep all your existing parsing methods unchanged
+    parseAdminsFromText(pageText) {
+        // ... your existing code unchanged
+        const lines = pageText.split('\n');
+        const admins = [];
+
+        console.log('🔍 Analyzing text for admin patterns...');
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            const nextLine = i + 1 < lines.length ? lines[i + 1].trim() : '';
+            const prevLine = i > 0 ? lines[i - 1].trim() : '';
+
+            if (line === 'Admin') {
+                if (prevLine && /^[a-zA-Z0-9_]{1,15}$/.test(prevLine)) {
+                    admins.push({
+                        username: prevLine,
+                        badgeType: 'Admin',
+                        source: 'text_analysis',
+                        pattern: 'username_before_admin'
+                    });
+                    console.log(`👑 Found admin: @${prevLine} (pattern: username before Admin)`);
+                }
+                else if (nextLine && /^[a-zA-Z0-9_]{1,15}$/.test(nextLine)) {
+                    admins.push({
+                        username: nextLine,
+                        badgeType: 'Admin',
+                        source: 'text_analysis',
+                        pattern: 'username_after_admin'
+                    });
+                    console.log(`👑 Found admin: @${nextLine} (pattern: username after Admin)`);
+                }
+            }
+            else if (line === 'Mod') {
+                if (prevLine && /^[a-zA-Z0-9_]{1,15}$/.test(prevLine)) {
+                    admins.push({
+                        username: prevLine,
+                        badgeType: 'Mod',
+                        source: 'text_analysis',
+                        pattern: 'username_before_mod'
+                    });
+                    console.log(`🛡️ Found mod: @${prevLine} (pattern: username before Mod)`);
+                }
+                else if (nextLine && /^[a-zA-Z0-9_]{1,15}$/.test(nextLine)) {
+                    admins.push({
+                        username: nextLine,
+                        badgeType: 'Mod',
+                        source: 'text_analysis',
+                        pattern: 'username_after_mod'
+                    });
+                    console.log(`🛡️ Found mod: @${nextLine} (pattern: username after Mod)`);
+                }
+            }
+            else if (line.startsWith('@')) {
+                const username = line.slice(1);
+                if (/^[a-zA-Z0-9_]{1,15}$/.test(username)) {
+                    let badgeType = 'Member';
+
+                    if (prevLine === 'Admin' || nextLine === 'Admin') {
+                        badgeType = 'Admin';
+                        console.log(`👑 Found admin: @${username} (pattern: @username with Admin badge)`);
+                    } else if (prevLine === 'Mod' || nextLine === 'Mod') {
+                        badgeType = 'Mod';
+                        console.log(`🛡️ Found mod: @${username} (pattern: @username with Mod badge)`);
+                    }
+
+                    admins.push({
+                        username: username,
+                        badgeType: badgeType,
+                        source: 'text_analysis',
+                        pattern: '@username_format'
+                    });
+                }
+            }
+            else if (/^[a-zA-Z0-9_]{1,15}$/.test(line)) {
+                let badgeType = 'Member';
+                let pattern = 'standalone_username';
+
+                for (let j = Math.max(0, i - 2); j <= Math.min(lines.length - 1, i + 2); j++) {
+                    if (j !== i) {
+                        const nearbyLine = lines[j].trim();
+                        if (nearbyLine === 'Admin') {
+                            badgeType = 'Admin';
+                            pattern = 'username_near_admin';
+                            console.log(`👑 Found admin: @${line} (pattern: username near Admin)`);
+                            break;
+                        } else if (nearbyLine === 'Mod') {
+                            badgeType = 'Mod';
+                            pattern = 'username_near_mod';
+                            console.log(`🛡️ Found mod: @${line} (pattern: username near Mod)`);
+                            break;
+                        }
+                    }
+                }
+
+                if (badgeType !== 'Member') {
+                    admins.push({
+                        username: line,
+                        badgeType: badgeType,
+                        source: 'text_analysis',
+                        pattern: pattern
+                    });
+                }
+            }
+        }
+
+        const uniqueAdmins = admins.filter((admin, index, self) =>
+            index === self.findIndex(a => a.username === admin.username)
+        ).sort((a, b) => {
+            if (a.badgeType === 'Admin' && b.badgeType === 'Mod') return -1;
+            if (a.badgeType === 'Mod' && b.badgeType === 'Admin') return 1;
+            return 0;
+        });
+
+        console.log(`🎯 Final unique admins found: ${uniqueAdmins.length}`);
+        return uniqueAdmins;
+    }
+
+    async extractAdminsFromScreenshot(communityId) {
+        // ... your existing code unchanged
+        console.log('📸 Taking screenshot and analyzing text...');
+
+        try {
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const screenshotFileName = `community_${communityId}_${timestamp}.png`;
+            const screenshotPath = `./output/${screenshotFileName}`;
+
+            await this.ensureOutputDirectory();
+
+            await this.page.screenshot({
+                path: screenshotPath,
+                fullPage: true,
+                type: 'png'
+            });
+
+            console.log(`📸 Screenshot saved: ${screenshotPath}`);
+
+            const pageText = await this.page.evaluate(() => {
+                return document.body.innerText;
+            });
+
+            const textFileName = `community_${communityId}_text_${timestamp}.txt`;
+            const textPath = `./output/${textFileName}`;
+            await this.saveTextFile(textPath, pageText);
+
+            const admins = this.parseAdminsFromText(pageText);
+
+            console.log(`📝 Text analysis found ${admins.length} admin(s)`);
+
+            return admins;
+
+        } catch (error) {
+            console.error('❌ Screenshot method failed:', error);
+            return [];
+        }
+    }
+
+    async extractAdminsFromDOM() {
+        // ... your existing code unchanged
+        console.log('🔧 Using DOM scraping (backup method)...');
+
+        return await this.page.evaluate(() => {
+            const userCells = document.querySelectorAll('div[data-testid="UserCell"]');
+            const adminData = [];
+
+            userCells.forEach((cell) => {
+                const usernameLink = cell.querySelector('a[href^="/"]');
+
+                if (usernameLink) {
+                    const username = usernameLink.getAttribute('href').slice(1);
+
+                    const adminBadge = Array.from(cell.querySelectorAll('*')).find(el =>
+                        el.textContent && el.textContent.trim() === 'Admin'
+                    );
+
+                    const modBadge = Array.from(cell.querySelectorAll('*')).find(el =>
+                        el.textContent && el.textContent.trim() === 'Mod'
+                    );
+
+                    let badgeType = 'Member';
+                    if (adminBadge) {
+                        badgeType = 'Admin';
+                    } else if (modBadge) {
+                        badgeType = 'Mod';
+                    }
+
+                    adminData.push({
+                        username: username,
+                        badgeType: badgeType,
+                        source: 'dom_scraping',
+                        pattern: 'html_element'
+                    });
+                }
+            });
+
+            return adminData;
+        });
+    }
+
+    async close() {
+        if (this.browser) {
+            await this.browser.close();
+            this.isInitialized = false;
+        }
+    }
+
+    async ensureOutputDirectory() {
+        try {
+            await fs.access('./output');
+        } catch {
+            await fs.mkdir('./output', { recursive: true });
+            console.log('📁 Created output directory');
+        }
+    }
+
+    async saveTextFile(filePath, content) {
+        try {
+            await fs.writeFile(filePath, content, 'utf8');
+            console.log(`📝 Text saved: ${filePath}`);
+        } catch (error) {
+            console.error('❌ Failed to save text file:', error);
+        }
+    }
+}
+
+// CREATE GLOBAL SCRAPER INSTANCE
+const twitterScraper = new TwitterCommunityAdminScraper();
+
 class BotState {
     constructor() {
         this.isRunning = false;
@@ -266,7 +686,7 @@ class BotState {
     addToList(listType, entry) {
         const config = {
             id: Date.now().toString(),
-            address: entry.address || entry.username,
+            address: (entry.address || entry.username).trim(),
             amount: entry.amount,
             fees: entry.fees,
             mevProtection: entry.mevProtection,
@@ -307,8 +727,14 @@ class BotState {
     }
 
     checkAdminInPrimary(identifier) {
+        if (!identifier) return null;
+        const cleanIdentifier = identifier.trim().toLowerCase();
+
         for (const config of this.primaryAdminList.values()) {
-            if (config.address === identifier) {
+            const cleanAddress = config.address.trim().toLowerCase();
+            console.log(`🔍 Comparing "${cleanIdentifier}" with "${cleanAddress}"`);
+            if (cleanAddress === cleanIdentifier) {
+                console.log(`✅ MATCH FOUND in primary: ${cleanAddress}`);
                 return config;
             }
         }
@@ -316,8 +742,14 @@ class BotState {
     }
 
     checkAdminInSecondary(identifier) {
+        if (!identifier) return null;
+        const cleanIdentifier = identifier.trim().toLowerCase();
+
         for (const config of this.secondaryAdminList.values()) {
-            if (config.address === identifier) {
+            const cleanAddress = config.address.trim().toLowerCase();
+            console.log(`🔍 Comparing "${cleanIdentifier}" with "${cleanAddress}"`);
+            if (cleanAddress === cleanIdentifier) {
+                console.log(`✅ MATCH FOUND in secondary: ${cleanAddress}`);
                 return config;
             }
         }
@@ -367,7 +799,7 @@ class EnhancedBotState extends BotState {
     async addToList(listType, entry) {
         const config = {
             id: Date.now().toString(),
-            address: entry.address || entry.username,
+            address: (entry.address || entry.username).trim(),
             amount: entry.amount,
             fees: entry.fees,
             mevProtection: entry.mevProtection,
@@ -481,7 +913,7 @@ function extractTwitterData(input) {
 
     // If it's just a handle without URL
     if (cleanInput.startsWith('@')) {
-        const handle = cleanInput.substring(1).toLowerCase();
+        const handle = cleanInput.substring(1).trim().toLowerCase(); // Add .trim()
         console.log(`👤 Found handle without URL: @${handle}`);
         return {
             type: 'individual',
@@ -493,7 +925,7 @@ function extractTwitterData(input) {
 
     // If it's just a plain username (be more strict here)
     if (/^[a-zA-Z0-9_]{1,15}$/.test(cleanInput)) {
-        const handle = cleanInput.toLowerCase();
+        const handle = cleanInput.trim().toLowerCase(); // Add .trim()
         console.log(`👤 Found plain username: @${handle}`);
         return {
             type: 'individual',
@@ -904,6 +1336,336 @@ async function fetchTokenMetadata(uri) {
 
 // ONLY REPLACE processNewToken() function with this fixed version:
 
+// ADD THIS COMMUNITY MATCHING FUNCTION
+// ADD THIS COMMUNITY MATCHING FUNCTION
+async function scrapeCommunityAndMatchAdmins(communityId, tokenData) {
+    try {
+        console.log(`🔍 Scraping community ${communityId} for admin matching...`);
+
+        // First, check if the community ID itself is in our lists (FALLBACK METHOD)
+        const communityIdStr = communityId.toString();
+
+        // Check primary admins list for community ID
+        const primaryAdminConfig = botState.checkAdminInPrimary(communityIdStr);
+        if (primaryAdminConfig) {
+            console.log(`🎯 Community ID ${communityId} found directly in PRIMARY admin list!`);
+            
+            // Broadcast to frontend
+            broadcastToClients({
+                type: 'community_id_match_found',
+                data: {
+                    communityId: communityId,
+                    matchType: 'primary',
+                    matchedAs: 'community_id_direct',
+                    yourPrimaryList: Array.from(botState.primaryAdminList.values()).map(item => item.address),
+                    yourSecondaryList: Array.from(botState.secondaryAdminList.values()).map(item => item.address)
+                }
+            });
+
+            return {
+                matchType: 'primary_admin',
+                matchedEntity: `Community ${communityId}`,
+                detectionReason: `Primary Community ID: ${communityId}`,
+                config: primaryAdminConfig,
+                communityAdmins: [],
+                matchedAdmin: { username: communityId, badgeType: 'Community' }
+            };
+        }
+
+        // Check secondary admins list for community ID
+        const secondaryAdminConfig = botState.checkAdminInSecondary(communityIdStr);
+        if (secondaryAdminConfig) {
+            console.log(`🔔 Community ID ${communityId} found directly in SECONDARY admin list!`);
+            
+            // Broadcast to frontend
+            broadcastToClients({
+                type: 'community_id_match_found',
+                data: {
+                    communityId: communityId,
+                    matchType: 'secondary',
+                    matchedAs: 'community_id_direct',
+                    yourPrimaryList: Array.from(botState.primaryAdminList.values()).map(item => item.address),
+                    yourSecondaryList: Array.from(botState.secondaryAdminList.values()).map(item => item.address)
+                }
+            });
+
+            return {
+                matchType: 'secondary_admin',
+                matchedEntity: `Community ${communityId}`,
+                detectionReason: `Secondary Community ID: ${communityId}`,
+                config: secondaryAdminConfig,
+                communityAdmins: [],
+                matchedAdmin: { username: communityId, badgeType: 'Community' }
+            };
+        }
+
+        // If community ID not in lists, try scraping community admins
+        console.log(`📋 Community ID not in lists, attempting to scrape community admins...`);
+
+        // Initialize scraper if needed
+        if (!twitterScraper.isInitialized) {
+            console.log(`🤖 Initializing Twitter scraper...`);
+            const initSuccess = await twitterScraper.init();
+            if (!initSuccess) {
+                console.log(`❌ Failed to initialize Twitter scraper, using community ID fallback`);
+                
+                // Broadcast initialization failure
+                broadcastToClients({
+                    type: 'community_scraping_failed',
+                    data: {
+                        communityId: communityId,
+                        reason: 'Failed to initialize Twitter scraper',
+                        step: 'initialization',
+                        fallbackUsed: true,
+                        communityIdInPrimary: false,
+                        communityIdInSecondary: false,
+                        yourPrimaryList: Array.from(botState.primaryAdminList.values()).map(item => item.address),
+                        yourSecondaryList: Array.from(botState.secondaryAdminList.values()).map(item => item.address)
+                    }
+                });
+                
+                return null;
+            }
+        }
+
+        // Check session status instead of trying to login
+        console.log(`🔍 Checking Twitter session status...`);
+        const sessionStatus = await twitterScraper.checkSessionStatus();
+
+        if (!sessionStatus.loggedIn) {
+            console.log(`❌ Twitter session not active: ${sessionStatus.error || 'Not logged in'}`);
+            
+            // Broadcast session not active
+            broadcastToClients({
+                type: 'community_scraping_failed',
+                data: {
+                    communityId: communityId,
+                    reason: 'Twitter session not active - admin needs to login manually',
+                    step: 'session_check',
+                    fallbackUsed: true,
+                    sessionStatus: sessionStatus,
+                    communityIdInPrimary: botState.checkAdminInPrimary(communityIdStr) ? true : false,
+                    communityIdInSecondary: botState.checkAdminInSecondary(communityIdStr) ? true : false,
+                    yourPrimaryList: Array.from(botState.primaryAdminList.values()).map(item => item.address),
+                    yourSecondaryList: Array.from(botState.secondaryAdminList.values()).map(item => item.address),
+                    needsManualLogin: true
+                }
+            });
+            
+            return null;
+        }
+
+        console.log(`✅ Twitter session is active, proceeding with community scraping...`);
+
+        // Scrape community admins
+        console.log(`🕷️ Scraping community ${communityId} for admin list...`);
+        const communityAdmins = await twitterScraper.scrapeCommunityAdmins(communityId);
+
+        if (communityAdmins.length === 0) {
+            console.log(`⚠️ No admins found in community ${communityId}`);
+            
+            // Broadcast no admins found
+            broadcastToClients({
+                type: 'community_scraping_failed',
+                data: {
+                    communityId: communityId,
+                    reason: 'No admins found in community',
+                    step: 'scraping',
+                    fallbackUsed: true,
+                    communityIdInPrimary: botState.checkAdminInPrimary(communityIdStr) ? true : false,
+                    communityIdInSecondary: botState.checkAdminInSecondary(communityIdStr) ? true : false,
+                    yourPrimaryList: Array.from(botState.primaryAdminList.values()).map(item => item.address),
+                    yourSecondaryList: Array.from(botState.secondaryAdminList.values()).map(item => item.address)
+                }
+            });
+            
+            return null;
+        }
+
+        console.log(`📊 Found ${communityAdmins.length} admin(s) in community ${communityId}:`,
+            communityAdmins.map(admin => `@${admin.username} (${admin.badgeType})`));
+
+        // 🔥 NEW: Broadcast successful scraping to frontend for debugging
+        broadcastToClients({
+            type: 'community_admins_scraped',
+            data: {
+                communityId: communityId,
+                admins: communityAdmins,
+                totalAdmins: communityAdmins.length,
+                scrapedAt: new Date().toISOString(),
+                yourPrimaryList: Array.from(botState.primaryAdminList.values()).map(item => item.address),
+                yourSecondaryList: Array.from(botState.secondaryAdminList.values()).map(item => item.address)
+            }
+        });
+
+        // Check if any community admin is in our lists
+        for (const admin of communityAdmins) {
+            console.log(`🔍 Checking community admin: @${admin.username} (${admin.badgeType})`);
+
+            // Check primary admins list
+            const primaryAdminConfig = botState.checkAdminInPrimary(admin.username);
+            if (primaryAdminConfig) {
+                console.log(`🎯 Community admin @${admin.username} found in PRIMARY admin list!`);
+
+                // Broadcast match found
+                broadcastToClients({
+                    type: 'community_admin_match_found',
+                    data: {
+                        communityId: communityId,
+                        matchType: 'primary',
+                        matchedAdmin: admin,
+                        matchedAs: 'community_admin_scraping',
+                        allScrapedAdmins: communityAdmins
+                    }
+                });
+
+                return {
+                    matchType: 'primary_admin',
+                    matchedEntity: admin.username,
+                    detectionReason: `Primary Community Admin: @${admin.username} (${admin.badgeType}) from Community ${communityId}`,
+                    config: primaryAdminConfig,
+                    communityAdmins: communityAdmins,
+                    matchedAdmin: admin,
+                    scrapingMethod: 'community_admin_scraping'
+                };
+            }
+
+            // Check secondary admins list
+            const secondaryAdminConfig = botState.checkAdminInSecondary(admin.username);
+            if (secondaryAdminConfig) {
+                console.log(`🔔 Community admin @${admin.username} found in SECONDARY admin list!`);
+
+                // Broadcast match found
+                broadcastToClients({
+                    type: 'community_admin_match_found',
+                    data: {
+                        communityId: communityId,
+                        matchType: 'secondary',
+                        matchedAdmin: admin,
+                        matchedAs: 'community_admin_scraping',
+                        allScrapedAdmins: communityAdmins
+                    }
+                });
+
+                return {
+                    matchType: 'secondary_admin',
+                    matchedEntity: admin.username,
+                    detectionReason: `Secondary Community Admin: @${admin.username} (${admin.badgeType}) from Community ${communityId}`,
+                    config: secondaryAdminConfig,
+                    communityAdmins: communityAdmins,
+                    matchedAdmin: admin,
+                    scrapingMethod: 'community_admin_scraping'
+                };
+            }
+
+            // Also check for username variations (with and without @)
+            const usernameVariations = [
+                admin.username,
+                `@${admin.username}`,
+                admin.username.toLowerCase(),
+                `@${admin.username.toLowerCase()}`
+            ];
+
+            for (const variation of usernameVariations) {
+                // Check primary with variations
+                const primaryVariationConfig = botState.checkAdminInPrimary(variation);
+                if (primaryVariationConfig) {
+                    console.log(`🎯 Community admin @${admin.username} found in PRIMARY admin list (variation: ${variation})!`);
+
+                    // Broadcast variation match found
+                    broadcastToClients({
+                        type: 'community_admin_match_found',
+                        data: {
+                            communityId: communityId,
+                            matchType: 'primary',
+                            matchedAdmin: admin,
+                            matchedAs: 'community_admin_scraping_variation',
+                            matchedVariation: variation,
+                            allScrapedAdmins: communityAdmins
+                        }
+                    });
+
+                    return {
+                        matchType: 'primary_admin',
+                        matchedEntity: variation,
+                        detectionReason: `Primary Community Admin: @${admin.username} (${admin.badgeType}) from Community ${communityId} (matched as ${variation})`,
+                        config: primaryVariationConfig,
+                        communityAdmins: communityAdmins,
+                        matchedAdmin: admin,
+                        scrapingMethod: 'community_admin_scraping_variation'
+                    };
+                }
+
+                // Check secondary with variations
+                const secondaryVariationConfig = botState.checkAdminInSecondary(variation);
+                if (secondaryVariationConfig) {
+                    console.log(`🔔 Community admin @${admin.username} found in SECONDARY admin list (variation: ${variation})!`);
+
+                    // Broadcast variation match found
+                    broadcastToClients({
+                        type: 'community_admin_match_found',
+                        data: {
+                            communityId: communityId,
+                            matchType: 'secondary',
+                            matchedAdmin: admin,
+                            matchedAs: 'community_admin_scraping_variation',
+                            matchedVariation: variation,
+                            allScrapedAdmins: communityAdmins
+                        }
+                    });
+
+                    return {
+                        matchType: 'secondary_admin',
+                        matchedEntity: variation,
+                        detectionReason: `Secondary Community Admin: @${admin.username} (${admin.badgeType}) from Community ${communityId} (matched as ${variation})`,
+                        config: secondaryVariationConfig,
+                        communityAdmins: communityAdmins,
+                        matchedAdmin: admin,
+                        scrapingMethod: 'community_admin_scraping_variation'
+                    };
+                }
+            }
+        }
+
+        console.log(`❌ No community admins from ${communityId} found in admin lists`);
+        console.log(`📋 Community admins found: ${communityAdmins.map(admin => `@${admin.username}`).join(', ')}`);
+        console.log(`📋 Primary admin list: ${Array.from(botState.primaryAdminList.values()).map(item => item.address).join(', ')}`);
+        console.log(`📋 Secondary admin list: ${Array.from(botState.secondaryAdminList.values()).map(item => item.address).join(', ')}`);
+
+        // Broadcast no matches found
+        broadcastToClients({
+            type: 'community_admins_no_match',
+            data: {
+                communityId: communityId,
+                scrapedAdmins: communityAdmins,
+                yourPrimaryList: Array.from(botState.primaryAdminList.values()).map(item => item.address),
+                yourSecondaryList: Array.from(botState.secondaryAdminList.values()).map(item => item.address),
+                totalScrapedAdmins: communityAdmins.length
+            }
+        });
+
+        return null;
+
+    } catch (error) {
+        console.error(`❌ Error scraping community ${communityId}:`, error);
+        console.error(`📋 Error details:`, error.message);
+        
+        // Broadcast error
+        broadcastToClients({
+            type: 'community_scraping_error',
+            data: {
+                communityId: communityId,
+                error: error.message,
+                step: 'unknown',
+                fallbackUsed: true
+            }
+        });
+        
+        return null;
+    }
+}
+
+// ========== COMPLETE ENHANCED processNewToken FUNCTION ==========
 async function processNewToken(tokenData, platform) {
     const tokenAddress = tokenData.mint;
     const creatorWallet = tokenData.creator || tokenData.traderPublicKey;
@@ -1007,6 +1769,68 @@ async function processNewToken(tokenData, platform) {
         }
     }
 
+    // ========== NEW: COMMUNITY ADMIN SCRAPING AND MATCHING ==========
+    if (botState.settings.enableAdminFilter && twitterData.type === 'community' && twitterData.id) {
+        console.log(`🏘️ Found Twitter community: ${twitterData.id} - scraping admins for matching...`);
+
+        // Scrape community admins and match with our lists
+        const communityMatchResult = await scrapeCommunityAndMatchAdmins(twitterData.id, completeTokenData);
+
+        if (communityMatchResult && communityMatchResult.matchType !== 'no_match') {
+            console.log(`🎯 Community admin match found: ${communityMatchResult.matchType}`);
+
+            const detectedTokenData = {
+                ...completeTokenData,
+                matchType: communityMatchResult.matchType,
+                matchedEntity: communityMatchResult.matchedEntity,
+                detectionReason: communityMatchResult.detectionReason,
+                config: communityMatchResult.config,
+                communityAdmins: communityMatchResult.communityAdmins,
+                matchedAdmin: communityMatchResult.matchedAdmin
+            };
+
+            botState.addDetectedToken(tokenAddress, detectedTokenData);
+
+            // Save community to Firebase on match
+            await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
+
+            if (communityMatchResult.matchType === 'primary_admin') {
+                broadcastToClients({
+                    type: 'token_detected',
+                    data: detectedTokenData
+                });
+
+                if (!botState.settings.detectionOnlyMode) {
+                    await snipeToken(tokenAddress, communityMatchResult.config);
+                }
+            } else if (communityMatchResult.matchType === 'secondary_admin') {
+                // Trigger popup for secondary matches
+                broadcastToClients({
+                    type: 'secondary_popup_trigger',
+                    data: {
+                        tokenData: detectedTokenData,
+                        globalSnipeSettings: botState.settings.globalSnipeSettings,
+                        timestamp: new Date().toISOString()
+                    }
+                });
+
+                // Play sound notification
+                broadcastToClients({
+                    type: 'secondary_notification',
+                    data: {
+                        tokenAddress,
+                        soundNotification: communityMatchResult.config.soundNotification,
+                        timestamp: new Date().toISOString()
+                    }
+                });
+            }
+            return;
+        } else {
+            console.log(`❌ No community admins from ${twitterData.id} found in admin lists`);
+            // Continue with regular processing if no admin match found
+        }
+    }
+
     // Check if "snipe all tokens" mode is enabled
     if (botState.settings.snipeAllTokens) {
         console.log(`🎯 SNIPE ALL MODE: Token detected - ${tokenAddress}`);
@@ -1041,148 +1865,71 @@ async function processNewToken(tokenData, platform) {
     if (botState.settings.enableAdminFilter) {
         console.log('📋 Current Primary Admins List:', Array.from(botState.primaryAdminList.values()).map(item => item.address));
 
-        // 1. Check Twitter Community/Individual Admin matching
-        if (twitterData.admin) {
-            // Handle Twitter communities
-            if (twitterData.type === 'community') {
-                console.log(`🏘️ Found Twitter community: ${twitterData.id}`);
+        // 1. Check Twitter Individual Admin matching
+        if (twitterData.admin && twitterData.type === 'individual') {
+            console.log(`👤 Found individual Twitter: @${twitterData.handle}`);
 
-                // Check if community ID is in primary admins list
-                const primaryAdminConfig = botState.checkAdminInPrimary(twitterData.id);
-                if (primaryAdminConfig) {
-                    console.log(`✅ Community ${twitterData.id} found in primary admin list!`);
+            // Check primary admins list
+            const primaryAdminConfig = botState.checkAdminInPrimary(twitterData.handle);
+            if (primaryAdminConfig) {
+                console.log(`✅ Admin @${twitterData.handle} found in primary admin list!`);
 
-                    const detectedTokenData = {
-                        ...completeTokenData,
-                        matchType: 'primary_admin',
-                        matchedEntity: `Community ${twitterData.id}`,
-                        detectionReason: `Primary Community: ${twitterData.id}`,
-                        config: primaryAdminConfig
-                    };
+                const detectedTokenData = {
+                    ...completeTokenData,
+                    matchType: 'primary_admin',
+                    matchedEntity: twitterData.handle,
+                    detectionReason: `Primary Admin: @${twitterData.handle}`,
+                    config: primaryAdminConfig
+                };
 
-                    botState.addDetectedToken(tokenAddress, detectedTokenData);
+                botState.addDetectedToken(tokenAddress, detectedTokenData);
 
-                    // ✅ SAVE COMMUNITY TO FIREBASE ON PRIMARY MATCH
-                    await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
+                broadcastToClients({
+                    type: 'token_detected',
+                    data: detectedTokenData
+                });
 
-                    broadcastToClients({
-                        type: 'token_detected',
-                        data: detectedTokenData
-                    });
-
-                    if (!botState.settings.detectionOnlyMode) {
-                        await snipeToken(tokenAddress, primaryAdminConfig);
-                    }
-                    return;
+                if (!botState.settings.detectionOnlyMode) {
+                    await snipeToken(tokenAddress, primaryAdminConfig);
                 }
-
-                // Check secondary admins list for community
-                const secondaryAdminConfig = botState.checkAdminInSecondary(twitterData.id);
-                if (secondaryAdminConfig) {
-                    console.log(`🔔 Community ${twitterData.id} found in secondary admin list!`);
-
-                    const detectedTokenData = {
-                        ...completeTokenData,
-                        matchType: 'secondary_admin',
-                        matchedEntity: `Community ${twitterData.id}`,
-                        detectionReason: `Secondary Community: ${twitterData.id}`,
-                        config: secondaryAdminConfig
-                    };
-
-                    botState.addDetectedToken(tokenAddress, detectedTokenData);
-
-                    // ✅ SAVE COMMUNITY TO FIREBASE ON SECONDARY MATCH
-                    await markCommunityAsUsedInFirebase(twitterData.id, detectedTokenData);
-
-                    // Trigger popup for secondary matches
-                    broadcastToClients({
-                        type: 'secondary_popup_trigger',
-                        data: {
-                            tokenData: detectedTokenData,
-                            globalSnipeSettings: botState.settings.globalSnipeSettings,
-                            timestamp: new Date().toISOString()
-                        }
-                    });
-
-                    // Play sound notification
-                    broadcastToClients({
-                        type: 'secondary_notification',
-                        data: {
-                            tokenAddress,
-                            soundNotification: secondaryAdminConfig.soundNotification,
-                            timestamp: new Date().toISOString()
-                        }
-                    });
-                    return;
-                }
+                return;
             }
 
-            // Handle individual Twitter accounts
-            else if (twitterData.type === 'individual') {
-                console.log(`👤 Found individual Twitter: @${twitterData.handle}`);
+            // Check secondary admins list
+            const secondaryAdminConfig = botState.checkAdminInSecondary(twitterData.handle);
+            if (secondaryAdminConfig) {
+                console.log(`🔔 Admin @${twitterData.handle} found in secondary admin list!`);
 
-                // Check primary admins list
-                const primaryAdminConfig = botState.checkAdminInPrimary(twitterData.handle);
-                if (primaryAdminConfig) {
-                    console.log(`✅ Admin @${twitterData.handle} found in primary admin list!`);
+                const detectedTokenData = {
+                    ...completeTokenData,
+                    matchType: 'secondary_admin',
+                    matchedEntity: twitterData.handle,
+                    detectionReason: `Secondary Admin: @${twitterData.handle}`,
+                    config: secondaryAdminConfig
+                };
 
-                    const detectedTokenData = {
-                        ...completeTokenData,
-                        matchType: 'primary_admin',
-                        matchedEntity: twitterData.handle,
-                        detectionReason: `Primary Admin: @${twitterData.handle}`,
-                        config: primaryAdminConfig
-                    };
+                botState.addDetectedToken(tokenAddress, detectedTokenData);
 
-                    botState.addDetectedToken(tokenAddress, detectedTokenData);
-
-                    broadcastToClients({
-                        type: 'token_detected',
-                        data: detectedTokenData
-                    });
-
-                    if (!botState.settings.detectionOnlyMode) {
-                        await snipeToken(tokenAddress, primaryAdminConfig);
+                // Trigger popup for secondary matches
+                broadcastToClients({
+                    type: 'secondary_popup_trigger',
+                    data: {
+                        tokenData: detectedTokenData,
+                        globalSnipeSettings: botState.settings.globalSnipeSettings,
+                        timestamp: new Date().toISOString()
                     }
-                    return;
-                }
+                });
 
-                // Check secondary admins list
-                const secondaryAdminConfig = botState.checkAdminInSecondary(twitterData.handle);
-                if (secondaryAdminConfig) {
-                    console.log(`🔔 Admin @${twitterData.handle} found in secondary admin list!`);
-
-                    const detectedTokenData = {
-                        ...completeTokenData,
-                        matchType: 'secondary_admin',
-                        matchedEntity: twitterData.handle,
-                        detectionReason: `Secondary Admin: @${twitterData.handle}`,
-                        config: secondaryAdminConfig
-                    };
-
-                    botState.addDetectedToken(tokenAddress, detectedTokenData);
-
-                    // Trigger popup for secondary matches
-                    broadcastToClients({
-                        type: 'secondary_popup_trigger',
-                        data: {
-                            tokenData: detectedTokenData,
-                            globalSnipeSettings: botState.settings.globalSnipeSettings,
-                            timestamp: new Date().toISOString()
-                        }
-                    });
-
-                    // Play sound notification
-                    broadcastToClients({
-                        type: 'secondary_notification',
-                        data: {
-                            tokenAddress,
-                            soundNotification: secondaryAdminConfig.soundNotification,
-                            timestamp: new Date().toISOString()
-                        }
-                    });
-                    return;
-                }
+                // Play sound notification
+                broadcastToClients({
+                    type: 'secondary_notification',
+                    data: {
+                        tokenAddress,
+                        soundNotification: secondaryAdminConfig.soundNotification,
+                        timestamp: new Date().toISOString()
+                    }
+                });
+                return;
             }
         }
 
@@ -1429,6 +2176,49 @@ app.post('/api/upload-sound', uploadSound.single('soundFile'), async (req, res) 
         });
     } catch (error) {
         console.error('Error uploading sound file:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ADD THIS NEW ENDPOINT after line ~1850:
+app.post('/api/clean-admin-lists', async (req, res) => {
+    try {
+        console.log('🧹 Cleaning admin list entries...');
+
+        // Clean primary admins
+        for (const [id, config] of botState.primaryAdminList.entries()) {
+            if (config.address) {
+                const cleanAddress = config.address.trim();
+                if (cleanAddress !== config.address) {
+                    console.log(`Cleaning primary admin: "${config.address}" -> "${cleanAddress}"`);
+                    config.address = cleanAddress;
+
+                    // Update in Firebase
+                    await saveAdminListToFirebase('primary_admins', config);
+                }
+            }
+        }
+
+        // Clean secondary admins
+        for (const [id, config] of botState.secondaryAdminList.entries()) {
+            if (config.address) {
+                const cleanAddress = config.address.trim();
+                if (cleanAddress !== config.address) {
+                    console.log(`Cleaning secondary admin: "${config.address}" -> "${cleanAddress}"`);
+                    config.address = cleanAddress;
+
+                    // Update in Firebase
+                    await saveAdminListToFirebase('secondary_admins', config);
+                }
+            }
+        }
+
+        res.json({
+            success: true,
+            message: 'Admin lists cleaned successfully'
+        });
+
+    } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
@@ -2189,6 +2979,93 @@ app.post('/api/demo/inject-from-list', (req, res) => {
     });
 });
 
+// ADD THESE NEW API ENDPOINTS
+app.post('/api/scrape-community/:communityId', async (req, res) => {
+    try {
+        const { communityId } = req.params;
+
+        if (!twitterScraper.isInitialized) {
+            const initSuccess = await twitterScraper.init();
+            if (!initSuccess) {
+                return res.status(500).json({ error: 'Failed to initialize Twitter scraper' });
+            }
+        }
+
+        const loginSuccess = await twitterScraper.automaticLogin();
+        if (!loginSuccess) {
+            return res.status(500).json({ error: 'Failed to login to Twitter' });
+        }
+
+        const communityAdmins = await twitterScraper.scrapeCommunityAdmins(communityId);
+
+        res.json({
+            success: true,
+            communityId: communityId,
+            admins: communityAdmins,
+            totalAdmins: communityAdmins.length,
+            scrapedAt: new Date().toISOString()
+        });
+
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/twitter-scraper-status', (req, res) => {
+    res.json({
+        initialized: twitterScraper.isInitialized,
+        sessionActive: twitterScraper.sessionActive,
+        credentialsConfigured: !!(TWITTER_CONFIG.username && TWITTER_CONFIG.password)
+    });
+});
+
+// Twitter session management endpoints
+app.get('/api/twitter-session-status', async (req, res) => {
+    try {
+        if (!twitterScraper.isInitialized) {
+            return res.json({
+                initialized: false,
+                loggedIn: false,
+                message: 'Twitter scraper not initialized'
+            });
+        }
+
+        const sessionStatus = await twitterScraper.checkSessionStatus();
+        res.json({
+            initialized: twitterScraper.isInitialized,
+            loggedIn: sessionStatus.loggedIn,
+            url: sessionStatus.url,
+            error: sessionStatus.error,
+            message: sessionStatus.loggedIn ? 'Session active' : 'Please login manually'
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/twitter-open-login', async (req, res) => {
+    try {
+        if (!twitterScraper.isInitialized) {
+            const initSuccess = await twitterScraper.init();
+            if (!initSuccess) {
+                return res.status(500).json({ error: 'Failed to initialize browser' });
+            }
+        }
+
+        const success = await twitterScraper.openLoginPage();
+        if (success) {
+            res.json({ 
+                success: true, 
+                message: 'Login page opened. Please login manually in the browser window.' 
+            });
+        } else {
+            res.status(500).json({ error: 'Failed to open login page' });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ========== WEBSOCKET CONNECTION HANDLING ==========
 
 wss.on('connection', (ws) => {
@@ -2272,6 +3149,17 @@ server.listen(PORT, async () => {
     console.log('  POST /api/demo/inject-batch - Inject multiple demo tokens');
     console.log('  POST /api/demo/inject-from-list - Inject token matching your lists');
     console.log('  GET /api/demo/templates - Get available demo templates');
+});
+
+// ADD GRACEFUL SHUTDOWN
+process.on('SIGINT', async () => {
+    console.log('\n⏹️ Shutting down gracefully...');
+
+    if (twitterScraper) {
+        await twitterScraper.close();
+    }
+
+    process.exit(0);
 });
 
 module.exports = { app, server, botState };
